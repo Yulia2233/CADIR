@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.vite/
+.env.local
+jobs/
+*.log
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+data/
+tmp/
+__pycache__/
+*.pyc
