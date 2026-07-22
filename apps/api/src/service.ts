@@ -7,7 +7,7 @@ import {
   type Artifact, type ArtifactKind, type Conversation, type CreateMessageRequest,
   type Job, type JobError, type JobEvent, type JobSnapshot, type RagArchiveEntry, type RagArchiveFile,
   type ModelEffort, type ModelOption, type ModelSettings, type ModelSettingsResponse,
-  type Stage, type StageTransitionRequest, type TokenUsage, type Upload,
+  type Stage, type StageRun, type StageTransitionRequest, type TokenUsage, type Upload,
 } from "../../../packages/contracts/src/index.js";
 import type { AppConfig } from "./config.js";
 import { AppError, notFound } from "./errors.js";
@@ -27,11 +27,13 @@ const modelIds = new Set(Object.keys(modelLabels));
 const effortIds: ModelEffort[] = ["low", "medium", "high"];
 
 function sumUsage(values: TokenUsage[]): TokenUsage {
-  return values.reduce((sum, item) => ({
+  const summed = values.reduce((sum, item) => ({
     input: sum.input + item.input, output: sum.output + item.output,
     reasoning: sum.reasoning + item.reasoning, cacheRead: sum.cacheRead + item.cacheRead,
-    cacheWrite: sum.cacheWrite + item.cacheWrite, total: sum.total + item.total,
+    cacheWrite: sum.cacheWrite + item.cacheWrite, total: 0,
   }), emptyUsage());
+  summed.total = summed.input + summed.output + summed.reasoning;
+  return summed;
 }
 
 function tokenUsage(tokens: any): TokenUsage {
@@ -45,9 +47,9 @@ function tokenUsage(tokens: any): TokenUsage {
     reasoning: finite(tokens?.reasoning),
     cacheRead: finite(tokens?.cache?.read ?? tokens?.cacheRead),
     cacheWrite: finite(tokens?.cache?.write ?? tokens?.cacheWrite),
-    total: finite(tokens?.total),
+    total: 0,
   };
-  if (!usage.total) usage.total = usage.input + usage.output + usage.reasoning + usage.cacheRead + usage.cacheWrite;
+  usage.total = usage.input + usage.output + usage.reasoning;
   return usage;
 }
 
@@ -58,14 +60,20 @@ function usageFromMessages(messages: unknown[]): TokenUsage {
 }
 
 function subtractUsage(current: TokenUsage, baseline: TokenUsage): TokenUsage {
-  return {
+  const difference = {
     input: Math.max(0, current.input - baseline.input),
     output: Math.max(0, current.output - baseline.output),
     reasoning: Math.max(0, current.reasoning - baseline.reasoning),
     cacheRead: Math.max(0, current.cacheRead - baseline.cacheRead),
     cacheWrite: Math.max(0, current.cacheWrite - baseline.cacheWrite),
-    total: Math.max(0, current.total - baseline.total),
+    total: 0,
   };
+  difference.total = difference.input + difference.output + difference.reasoning;
+  return difference;
+}
+
+function withoutCacheTotal(usage: TokenUsage): TokenUsage {
+  return { ...usage, total: usage.input + usage.output + usage.reasoning };
 }
 
 export class CadirService {
@@ -94,6 +102,55 @@ export class CadirService {
     const item = this.store.read((state) => state.conversations.find((entry) => entry.id === id));
     if (!item) throw notFound("conversation");
     return item;
+  }
+
+  private findConversationJob(conversationId: string): Job | undefined {
+    return this.store.read((state) => {
+      const conversation = state.conversations.find((item) => item.id === conversationId);
+      if (!conversation) return undefined;
+      const active = [...state.jobs].reverse().find((item) => item.conversationId === conversationId && !isTerminalJob(item.status));
+      if (active) return active;
+      if (conversation.jobId) {
+        const mapped = state.jobs.find((item) => item.id === conversation.jobId && item.conversationId === conversationId);
+        if (mapped) return mapped;
+      }
+      if (conversation.latestJobId) {
+        const latest = state.jobs.find((item) => item.id === conversation.latestJobId && item.conversationId === conversationId);
+        if (latest) return latest;
+      }
+      return [...state.jobs].reverse().find((item) => item.conversationId === conversationId);
+    });
+  }
+
+  private jobRevision(job: Job): number {
+    return Math.max(1, job.revision ?? 1);
+  }
+
+  private isCurrentRevision(job: Job, revision: number | undefined): boolean {
+    return (revision ?? 1) === this.jobRevision(job);
+  }
+
+  private currentStageRuns(state: Readonly<DatabaseState>, job: Job): StageRun[] {
+    return state.stageRuns.filter((run) => run.jobId === job.id && this.isCurrentRevision(job, run.revision));
+  }
+
+  private stageEventData(run: StageRun, data: Record<string, unknown> = {}): Record<string, unknown> {
+    return { stage: run.stage, status: run.status, attempt: run.attempt, stageRunId: run.id, revision: run.revision ?? 1, ...data };
+  }
+
+  private modificationPrompt(content: string, workspacePath: string, uploads: Array<{ localPath: string }>): string {
+    const images = uploads.length
+      ? `\n\nAdditional reference images (read these exact paths):\n${uploads.map((item) => `- ${item.localPath}`).join("\n")}`
+      : "";
+    return [
+      "This is a modification request for the existing CAD model in the current CADIR session, not a new modeling task.",
+      "Do not restart the requirements stage or create a new model from scratch.",
+      `Read the existing requirements.md, model.py, model.json, and the current artifacts in ${workspacePath}.`,
+      "Preserve the existing model and requirements unless the user's change requires a direct update.",
+      "Apply the requested change directly to model.py and model.json, run cadir_run, then continue through visual feedback and self-evolution.",
+      "Before publishing, update summary.md and experience.md so they include the original requirement and all completed modifications in this CAD session.",
+      `User modification request:\n${content.trim()}`,
+    ].join("\n\n") + images;
   }
 
   async getModelSettings(): Promise<ModelSettingsResponse> {
@@ -132,8 +189,14 @@ export class CadirService {
     if (conversation.deletionStatus) throw new AppError(409, "CONVERSATION_DELETING", "conversation is being deleted");
     if (request.resumeJobId) return await this.resumeJob(conversation, request);
 
-    const active = this.store.read((state) => state.jobs.find((job) => job.conversationId === conversationId && !isTerminalJob(job.status)));
-    if (active) throw new AppError(409, "JOB_ALREADY_ACTIVE", "conversation already has an active job");
+    const existingJob = this.findConversationJob(conversationId);
+    if (existingJob && !isTerminalJob(existingJob.status)) throw new AppError(409, "JOB_ALREADY_ACTIVE", "conversation already has an active job");
+    if (existingJob) return await this.startModification(conversation, existingJob, request);
+    return await this.startInitialJob(conversation, request);
+  }
+
+  private async startInitialJob(conversation: Conversation, request: CreateMessageRequest): Promise<JobSnapshot> {
+    const conversationId = conversation.id;
 
     const jobId = randomUUID();
     const selectedSettings = this.store.read((state) => state.modelSettings ?? { modelId: this.config.modelId, effort: "medium" as ModelEffort });
@@ -149,27 +212,29 @@ export class CadirService {
       const job: Job = {
         id: jobId, conversationId, status: "running", currentStage: "requirements", workspacePath,
         createdAt: timestamp, startedAt: timestamp, updatedAt: timestamp, backendHeartbeatAt: timestamp,
-        modelId: selectedSettings.modelId, modelProvider: this.config.modelProvider, effort: selectedSettings.effort,
+        modelId: selectedSettings.modelId, modelProvider: this.config.modelProvider, effort: selectedSettings.effort, revision: 1,
       };
       state.jobs.push(job);
-      state.stageRuns.push({ id: randomUUID(), jobId, stage: "requirements", attempt: 1, status: "running", usage: emptyUsage(), usageBaseline: emptyUsage(), startedAt: timestamp });
+      const stageRunId = randomUUID();
+      state.stageRuns.push({ id: stageRunId, jobId, stage: "requirements", revision: 1, attempt: 1, status: "running", usage: emptyUsage(), usageBaseline: emptyUsage(), startedAt: timestamp });
       const inputArtifacts = uploads.map(({ upload, localPath }): Artifact => {
         const id = randomUUID();
-        return { id, jobId, name: upload.name, kind: "image", path: localPath, mimeType: upload.mimeType, size: upload.size, validated: true, partial: false, createdAt: timestamp, downloadUrl: upload.downloadUrl };
+        return { id, jobId, revision: 1, name: upload.name, kind: "image", path: localPath, mimeType: upload.mimeType, size: upload.size, validated: true, partial: false, createdAt: timestamp, downloadUrl: upload.downloadUrl };
       });
       state.artifacts.push(...inputArtifacts);
       state.messages.push({
         id: randomUUID(), conversationId, jobId, role: "user", content: request.content.trim(),
         imageArtifactIds: inputArtifacts.map((item) => item.id), createdAt: timestamp, completedAt: timestamp,
       });
+      liveConversation.jobId = jobId;
       liveConversation.latestJobId = jobId;
       liveConversation.latestJobStatus = "running";
       liveConversation.title = liveConversation.revision === 1 && liveConversation.title === "New CAD session" ? request.content.trim().slice(0, 40) : liveConversation.title;
       liveConversation.revision += 1;
       liveConversation.updatedAt = timestamp;
       return [
-        this.appendEvent(state, job, "job.started", { status: "running" }),
-        this.appendEvent(state, job, "stage.updated", { stage: "requirements", status: "running", attempt: 1, label: eventName("requirements") }),
+        this.appendEvent(state, job, "job.started", { status: "running", revision: 1 }),
+        this.appendEvent(state, job, "stage.updated", { stage: "requirements", status: "running", attempt: 1, stageRunId, revision: 1, label: eventName("requirements") }),
       ];
     });
     this.store.publish(initialEvents);
@@ -178,6 +243,74 @@ export class CadirService {
       const session = await this.adapter.createSession(conversation.title, workspacePath);
       await this.bindSession(jobId, session.id);
       await this.adapter.prompt(session.id, prompt, workspacePath, { modelId: selectedSettings.modelId, providerId: this.config.modelProvider, effort: selectedSettings.effort });
+    } catch (error) {
+      await this.failJob(jobId, "OPENCODE_UNAVAILABLE", this.safeError(error));
+    }
+    return this.getSnapshot(jobId);
+  }
+
+  private async startModification(conversation: Conversation, existingJob: Job, request: CreateMessageRequest): Promise<JobSnapshot> {
+    const jobId = existingJob.id;
+    const revision = this.jobRevision(existingJob) + 1;
+    const selectedSettings = this.store.read((state) => state.modelSettings ?? { modelId: this.config.modelId, effort: "medium" as ModelEffort });
+    const usageBaseline = await this.readUsageBaseline(existingJob);
+    const uploads = await this.localizeUploads(existingJob.workspacePath, this.resolveUploads(conversation.id, request.imageArtifactIds ?? []));
+    const prompt = this.modificationPrompt(request.content, existingJob.workspacePath, uploads);
+    const timestamp = now();
+    const events = await this.store.transaction((state) => {
+      const job = state.jobs.find((item) => item.id === jobId && item.conversationId === conversation.id);
+      if (!job) throw notFound("job");
+      if (!isTerminalJob(job.status)) throw new AppError(409, "JOB_ALREADY_ACTIVE", "conversation already has an active job");
+      const liveRevision = this.jobRevision(job);
+      const nextRevision = liveRevision + 1;
+      const stageRunId = randomUUID();
+      job.revision = nextRevision;
+      job.status = "running";
+      job.currentStage = "codegen";
+      job.error = undefined;
+      job.summary = undefined;
+      job.completedAt = undefined;
+      job.updatedAt = timestamp;
+      job.backendHeartbeatAt = timestamp;
+      job.modelId = selectedSettings.modelId;
+      job.modelProvider = this.config.modelProvider;
+      job.effort = selectedSettings.effort;
+      state.stageRuns.push({ id: stageRunId, jobId, stage: "codegen", revision: nextRevision, attempt: 1, status: "running", usage: emptyUsage(), usageBaseline, startedAt: timestamp });
+      const previousRequirements = [...state.artifacts].reverse().find((item) =>
+        item.jobId === job.id && item.name.toLowerCase() === "requirements.md" && item.validated && !item.partial);
+      if (previousRequirements) {
+        const requirementId = randomUUID();
+        state.artifacts.push({
+          ...previousRequirements,
+          id: requirementId,
+          revision: nextRevision,
+          stageRunId: undefined,
+          createdAt: timestamp,
+          downloadUrl: `/api/jobs/${job.id}/artifacts/${requirementId}/download`,
+        });
+      }
+      const inputArtifacts = uploads.map(({ upload, localPath }): Artifact => {
+        const id = randomUUID();
+        return { id, jobId, revision: nextRevision, name: upload.name, kind: "image", path: localPath, mimeType: upload.mimeType, size: upload.size, validated: true, partial: false, createdAt: timestamp, downloadUrl: upload.downloadUrl };
+      });
+      state.artifacts.push(...inputArtifacts);
+      state.messages.push({ id: randomUUID(), conversationId: conversation.id, jobId, role: "user", content: request.content.trim(), imageArtifactIds: inputArtifacts.map((item) => item.id), createdAt: timestamp, completedAt: timestamp });
+      this.touchConversation(state, job);
+      return [
+        this.appendEvent(state, job, "job.started", { status: "running", revision: nextRevision, modification: true }),
+        this.appendEvent(state, job, "stage.updated", { stage: "codegen", status: "running", attempt: 1, stageRunId, revision: nextRevision, modification: true, label: eventName("codegen") }),
+      ];
+    });
+    this.store.publish(events);
+    try {
+      let sessionId = this.getSnapshot(jobId).job.openCodeSessionId;
+      if (!sessionId) {
+        const session = await this.adapter.createSession(conversation.title, existingJob.workspacePath);
+        sessionId = session.id;
+        await this.bindSession(jobId, sessionId);
+      }
+      const job = this.getSnapshot(jobId).job;
+      await this.adapter.prompt(sessionId, prompt, job.workspacePath, this.promptModel(job));
     } catch (error) {
       await this.failJob(jobId, "OPENCODE_UNAVAILABLE", this.safeError(error));
     }
@@ -197,18 +330,20 @@ export class CadirService {
       if (!job) throw notFound("job");
       if (job.status !== "waiting_input") throw new AppError(409, "JOB_NOT_WAITING", "job is not waiting for input");
       const timestamp = now();
-      const old = state.stageRuns.find((run) => run.jobId === job.id && run.status === "waiting_input");
+      const revision = this.jobRevision(job);
+      const old = state.stageRuns.find((run) => run.jobId === job.id && this.isCurrentRevision(job, run.revision) && run.status === "waiting_input");
       const attempt = old ? old.attempt + 1 : 1;
       const inputArtifacts = uploads.map(({ upload, localPath }): Artifact => {
         const id = randomUUID();
-        return { id, jobId, name: upload.name, kind: "image", path: localPath, mimeType: upload.mimeType, size: upload.size, validated: true, partial: false, createdAt: timestamp, downloadUrl: upload.downloadUrl };
+        return { id, jobId, revision, name: upload.name, kind: "image", path: localPath, mimeType: upload.mimeType, size: upload.size, validated: true, partial: false, createdAt: timestamp, downloadUrl: upload.downloadUrl };
       });
       state.artifacts.push(...inputArtifacts);
       state.messages.push({ id: randomUUID(), conversationId: conversation.id, jobId, role: "user", content: request.content.trim(), imageArtifactIds: inputArtifacts.map((item) => item.id), createdAt: timestamp, completedAt: timestamp });
-      state.stageRuns.push({ id: randomUUID(), jobId, stage: job.currentStage ?? "requirements", attempt, status: "running", usage: emptyUsage(), usageBaseline, startedAt: timestamp });
+      const stageRunId = randomUUID();
+      state.stageRuns.push({ id: stageRunId, jobId, stage: job.currentStage ?? "requirements", revision, attempt, status: "running", usage: emptyUsage(), usageBaseline, startedAt: timestamp });
       job.status = "running"; job.updatedAt = timestamp; job.error = undefined;
       this.touchConversation(state, job);
-      return [this.appendEvent(state, job, "stage.updated", { stage: job.currentStage, status: "running", attempt })];
+      return [this.appendEvent(state, job, "stage.updated", { stage: job.currentStage, status: "running", attempt, stageRunId, revision })];
     });
     this.store.publish(events);
     try {
@@ -233,7 +368,11 @@ export class CadirService {
     return this.store.read((state) => {
       const job = state.jobs.find((item) => item.id === jobId);
       if (!job) throw notFound("job");
-      const stageRuns = state.stageRuns.filter((run) => run.jobId === jobId);
+      const stageRuns = state.stageRuns.filter((run) => run.jobId === jobId).map((run) => ({
+        ...run,
+        usage: withoutCacheTotal(run.usage),
+        usageBaseline: run.usageBaseline ? withoutCacheTotal(run.usageBaseline) : undefined,
+      }));
       const messages = state.messages.filter((message) => message.jobId === jobId);
       const artifacts = state.artifacts.filter((artifact) => artifact.jobId === jobId);
       const events = state.events.filter((event) => event.jobId === jobId);
@@ -261,38 +400,43 @@ export class CadirService {
       if (!job) throw new AppError(404, "ACTIVE_JOB_NOT_FOUND", "no active job for this OpenCode session");
       if (isTerminalJob(job.status)) return [];
       if (request.action === "running") {
-        const existing = [...state.stageRuns].reverse().find((item) => item.jobId === job.id && item.stage === request.stage && item.status === "running");
+        const existing = [...this.currentStageRuns(state, job)].reverse().find((item) => item.stage === request.stage && item.status === "running");
         if (existing) return [];
         if (request.stage !== "evolution" && job.currentStage !== request.stage) throw new AppError(409, "INVALID_STAGE", `expected ${job.currentStage}, received ${request.stage}`);
-        const attempt = Math.max(0, ...state.stageRuns.filter((item) => item.jobId === job.id && item.stage === request.stage).map((item) => item.attempt)) + 1;
+        const attempt = Math.max(0, ...this.currentStageRuns(state, job).filter((item) => item.stage === request.stage).map((item) => item.attempt)) + 1;
         job.currentStage = request.stage;
-        state.stageRuns.push({ id: randomUUID(), jobId: job.id, stage: request.stage, attempt, status: "running", usage: emptyUsage(), usageBaseline, startedAt: now() });
+        const stageRun: StageRun = { id: randomUUID(), jobId: job.id, stage: request.stage, revision: this.jobRevision(job), attempt, status: "running", usage: emptyUsage(), usageBaseline, startedAt: now() };
+        state.stageRuns.push(stageRun);
         job.updatedAt = now(); this.touchConversation(state, job);
-        return [this.appendEvent(state, job, "stage.updated", { stage: request.stage, status: "running", attempt })];
+        return [this.appendEvent(state, job, "stage.updated", this.stageEventData(stageRun))];
       }
       if (request.action === "skipped") {
         if (request.stage !== "evolution") throw new AppError(409, "INVALID_SKIP", "only evolution may be skipped");
-        const existing = [...state.stageRuns].reverse().find((item) => item.jobId === job.id && item.stage === "evolution");
+        let existing = [...this.currentStageRuns(state, job)].reverse().find((item) => item.stage === "evolution");
         const timestamp = now();
         if (existing?.status === "skipped") return [];
         if (existing?.status === "running") { existing.status = "skipped"; existing.completedAt = timestamp; existing.summary = request.summary; }
-        else state.stageRuns.push({ id: randomUUID(), jobId: job.id, stage: "evolution", attempt: 1, status: "skipped", usage: emptyUsage(), usageBaseline, startedAt: timestamp, completedAt: timestamp, summary: request.summary });
-        const emitted = [this.appendEvent(state, job, "stage.updated", { stage: "evolution", status: "skipped", summary: request.summary })];
-        const latestVisual = [...state.stageRuns].reverse().find((item) => item.jobId === job.id && item.stage === "visual");
+        else {
+          const stageRun: StageRun = { id: randomUUID(), jobId: job.id, stage: "evolution", revision: this.jobRevision(job), attempt: 1, status: "skipped", usage: emptyUsage(), usageBaseline, startedAt: timestamp, completedAt: timestamp, summary: request.summary };
+          state.stageRuns.push(stageRun);
+          existing = stageRun;
+        }
+        const emitted = [this.appendEvent(state, job, "stage.updated", this.stageEventData(existing!, { summary: request.summary }))];
+        const latestVisual = [...this.currentStageRuns(state, job)].reverse().find((item) => item.stage === "visual");
         if (latestVisual?.status === "completed") {
           this.assertPublishArtifacts(state, job.id);
           await this.archiveEvolution(state, job, request.summary);
           job.status = "completed"; job.summary = request.summary ?? job.summary; job.completedAt = timestamp;
-          emitted.push(this.appendEvent(state, job, "job.completed", { summary: job.summary, artifacts: state.artifacts.filter((item) => item.jobId === job.id && item.validated).map((item) => ({ name: item.name, path: item.path, downloadUrl: item.downloadUrl })) }));
+          emitted.push(this.appendEvent(state, job, "job.completed", { summary: job.summary, revision: this.jobRevision(job), artifacts: state.artifacts.filter((item) => item.jobId === job.id && this.isCurrentRevision(job, item.revision) && item.validated).map((item) => ({ name: item.name, path: item.path, downloadUrl: item.downloadUrl })) }));
         } else if (latestVisual?.status === "failed") throw new AppError(409, "EVOLUTION_SKIP_INVALID", "evolution cannot be skipped after failed visual feedback");
         else job.currentStage = "visual";
         job.updatedAt = timestamp; this.touchConversation(state, job);
         return emitted;
       }
       if (job.currentStage !== request.stage) throw new AppError(409, "INVALID_STAGE", `expected ${job.currentStage}, received ${request.stage}`);
-      const run = [...state.stageRuns].reverse().find((item) => item.jobId === job.id && item.stage === request.stage && item.status === "running");
+      const run = [...this.currentStageRuns(state, job)].reverse().find((item) => item.stage === request.stage && item.status === "running");
       if (!run) {
-        const completed = [...state.stageRuns].reverse().find((item) => item.jobId === job.id && item.stage === request.stage && item.status === "completed");
+        const completed = [...this.currentStageRuns(state, job)].reverse().find((item) => item.stage === request.stage && item.status === "completed");
         if (request.action === "complete" && completed) return [];
         throw new AppError(409, "STAGE_NOT_RUNNING", "stage is not running");
       }
@@ -302,41 +446,44 @@ export class CadirService {
       if (request.action === "complete") {
         await this.assertStageArtifacts(state, job.id, request.stage, run.id);
         run.status = "completed"; run.completedAt = timestamp; run.summary = request.summary; run.toolError = undefined;
-        emitted.push(this.appendEvent(state, job, "stage.updated", { stage: request.stage, status: "completed", attempt: run.attempt, summary: request.summary }));
+        emitted.push(this.appendEvent(state, job, "stage.updated", this.stageEventData(run, { summary: request.summary })));
         const next = request.stage === "requirements" ? "codegen" : request.stage === "codegen" ? "visual" : request.stage === "visual" ? "evolution" : undefined;
         if (next) {
           job.currentStage = next;
-          const attempt = Math.max(0, ...state.stageRuns.filter((item) => item.jobId === job.id && item.stage === next).map((item) => item.attempt)) + 1;
-          state.stageRuns.push({ id: randomUUID(), jobId: job.id, stage: next, attempt, status: "running", usage: emptyUsage(), usageBaseline, startedAt: timestamp });
-          emitted.push(this.appendEvent(state, job, "stage.updated", { stage: next, status: "running", attempt, label: eventName(next) }));
+          const attempt = Math.max(0, ...this.currentStageRuns(state, job).filter((item) => item.stage === next).map((item) => item.attempt)) + 1;
+          const nextRun: StageRun = { id: randomUUID(), jobId: job.id, stage: next, revision: this.jobRevision(job), attempt, status: "running", usage: emptyUsage(), usageBaseline, startedAt: timestamp };
+          state.stageRuns.push(nextRun);
+          emitted.push(this.appendEvent(state, job, "stage.updated", this.stageEventData(nextRun, { label: eventName(next) })));
         } else if (request.stage === "evolution") {
-          const latestVisual = [...state.stageRuns].reverse().find((item) => item.jobId === job.id && item.stage === "visual");
+          const latestVisual = [...this.currentStageRuns(state, job)].reverse().find((item) => item.stage === "visual");
           if (latestVisual?.status !== "completed") throw new AppError(409, "EVOLUTION_REQUIRES_VISUAL_PASS", "evolution starts only after visual feedback passes");
           this.assertPublishArtifacts(state, job.id);
           await this.archiveEvolution(state, job, request.summary);
           job.status = "completed"; job.summary = request.summary ?? job.summary; job.completedAt = timestamp;
           emitted.push(this.appendEvent(state, job, "job.completed", {
             summary: job.summary,
-            artifacts: state.artifacts.filter((item) => item.jobId === job.id && item.validated).map((item) => ({ name: item.name, path: item.path, downloadUrl: item.downloadUrl })),
+            revision: this.jobRevision(job),
+            artifacts: state.artifacts.filter((item) => item.jobId === job.id && this.isCurrentRevision(job, item.revision) && item.validated).map((item) => ({ name: item.name, path: item.path, downloadUrl: item.downloadUrl })),
           }));
         }
       } else if (request.action === "retry") {
         run.status = "failed"; run.completedAt = timestamp; run.error = request.error ?? run.toolError ?? { code: "STAGE_RETRY", message: request.summary ?? "stage retry requested" };
-        emitted.push(this.appendEvent(state, job, "stage.updated", { stage: request.stage, status: "failed", attempt: run.attempt, retry: true }));
+        emitted.push(this.appendEvent(state, job, "stage.updated", this.stageEventData(run, { retry: true })));
         const retryStage: Stage = request.stage === "visual" ? "codegen" : request.stage;
-        const attempt = Math.max(0, ...state.stageRuns.filter((item) => item.jobId === job.id && item.stage === retryStage).map((item) => item.attempt)) + 1;
+        const attempt = Math.max(0, ...this.currentStageRuns(state, job).filter((item) => item.stage === retryStage).map((item) => item.attempt)) + 1;
         job.currentStage = retryStage;
-        state.stageRuns.push({ id: randomUUID(), jobId: job.id, stage: retryStage, attempt, status: "running", usage: emptyUsage(), usageBaseline, startedAt: timestamp });
-        emitted.push(this.appendEvent(state, job, "stage.updated", { stage: retryStage, status: "running", attempt, retry: true }));
+        const retryRun: StageRun = { id: randomUUID(), jobId: job.id, stage: retryStage, revision: this.jobRevision(job), attempt, status: "running", usage: emptyUsage(), usageBaseline, startedAt: timestamp };
+        state.stageRuns.push(retryRun);
+        emitted.push(this.appendEvent(state, job, "stage.updated", this.stageEventData(retryRun, { retry: true })));
       } else if (request.action === "needs_input") {
         run.status = "waiting_input"; run.completedAt = timestamp; run.summary = request.summary;
         job.status = "waiting_input";
-        emitted.push(this.appendEvent(state, job, "job.needs_input", { stage: request.stage, summary: request.summary }));
+        emitted.push(this.appendEvent(state, job, "job.needs_input", { stage: request.stage, revision: this.jobRevision(job), stageRunId: run.id, summary: request.summary }));
       } else {
         run.status = "failed"; run.completedAt = timestamp; run.error = request.error ?? run.toolError ?? { code: "STAGE_FAILED", message: request.summary ?? "stage failed" };
         job.status = "failed"; job.error = run.error; job.completedAt = timestamp;
-        emitted.push(this.appendEvent(state, job, "stage.updated", { stage: request.stage, status: "failed", error: run.error }));
-        emitted.push(this.appendEvent(state, job, "job.failed", { error: job.error }));
+        emitted.push(this.appendEvent(state, job, "stage.updated", this.stageEventData(run, { error: run.error })));
+        emitted.push(this.appendEvent(state, job, "job.failed", { error: job.error, revision: this.jobRevision(job) }));
       }
       job.updatedAt = timestamp; job.backendHeartbeatAt = timestamp;
       this.touchConversation(state, job);
@@ -356,8 +503,8 @@ export class CadirService {
       if (isTerminalJob(job.status)) return [];
       const timestamp = now(); sessionId = job.openCodeSessionId;
       job.status = "cancelled"; job.completedAt = timestamp; job.updatedAt = timestamp;
-      for (const run of state.stageRuns.filter((item) => item.jobId === jobId && item.status === "running")) { run.status = "cancelled"; run.completedAt = timestamp; }
-      for (const artifact of state.artifacts.filter((item) => item.jobId === jobId)) artifact.partial = true;
+      for (const run of state.stageRuns.filter((item) => item.jobId === jobId && this.isCurrentRevision(job, item.revision) && item.status === "running")) { run.status = "cancelled"; run.completedAt = timestamp; }
+      for (const artifact of state.artifacts.filter((item) => item.jobId === jobId && this.isCurrentRevision(job, item.revision))) artifact.partial = true;
       this.touchConversation(state, job);
       return [this.appendEvent(state, job, "job.cancelled", {})];
     });
@@ -376,12 +523,13 @@ export class CadirService {
       sessionId = job.openCodeSessionId;
       if (!sessionId) throw new AppError(409, "OPENCODE_SESSION_MISSING", "job has no OpenCode session");
       const stage = job.currentStage ?? "requirements";
-      const attempt = Math.max(0, ...state.stageRuns.filter((item) => item.jobId === jobId && item.stage === stage).map((item) => item.attempt)) + 1;
+      const attempt = Math.max(0, ...state.stageRuns.filter((item) => item.jobId === jobId && this.isCurrentRevision(job, item.revision) && item.stage === stage).map((item) => item.attempt)) + 1;
       const timestamp = now();
       job.status = "running"; job.error = undefined; job.completedAt = undefined; job.updatedAt = timestamp;
-      state.stageRuns.push({ id: randomUUID(), jobId, stage, attempt, status: "running", usage: emptyUsage(), usageBaseline, startedAt: timestamp });
+      const stageRun: StageRun = { id: randomUUID(), jobId, stage, revision: this.jobRevision(job), attempt, status: "running", usage: emptyUsage(), usageBaseline, startedAt: timestamp };
+      state.stageRuns.push(stageRun);
       this.touchConversation(state, job);
-      return [this.appendEvent(state, job, "stage.updated", { stage, attempt, status: "running", retry: true })];
+      return [this.appendEvent(state, job, "stage.updated", this.stageEventData(stageRun, { retry: true }))];
     });
     this.store.publish(events);
     try {
@@ -437,10 +585,10 @@ export class CadirService {
     const artifact = await this.store.transaction((state) => {
       const job = state.jobs.find((item) => item.openCodeSessionId === input.sessionID && !isTerminalJob(item.status));
       if (!job) throw new AppError(404, "ACTIVE_JOB_NOT_FOUND", "active job not found");
-      const run = [...state.stageRuns].reverse().find((item) => item.jobId === job.id && item.status === "running");
+      const run = [...this.currentStageRuns(state, job)].reverse().find((item) => item.status === "running");
       const id = randomUUID();
       const item: Artifact = {
-        id, jobId: job.id, stageRunId: run?.id, name: basename(absolute), kind: input.kind, path: absolute,
+        id, jobId: job.id, revision: this.jobRevision(job), stageRunId: run?.id, name: basename(absolute), kind: input.kind, path: absolute,
         mimeType: input.mimeType ?? "application/octet-stream", size: file.size, validated: input.validated ?? false,
         partial: input.partial ?? false, createdAt: now(), downloadUrl: `/api/jobs/${job.id}/artifacts/${id}/download`,
       };
@@ -503,7 +651,7 @@ export class CadirService {
         ? this.extractErrorText(part?.state?.error ?? part?.error ?? properties.error)
         : undefined;
       const error = detail ? this.classifyOpenCodeError(detail, "tool") : undefined;
-      const run = [...state.stageRuns].reverse().find((item) => item.jobId === jobId && item.status === "running");
+      const run = [...this.currentStageRuns(state, job)].reverse().find((item) => item.status === "running");
       if (run && error) run.toolError = error;
       if (run && status === "completed" && tool === "cadir_run") run.toolError = undefined;
       const safe = { tool, status, rawType, error, clearToolError: status === "completed" && tool === "cadir_run" };
@@ -527,8 +675,8 @@ export class CadirService {
     return this.store.read((state) => state.jobs.filter((job) => {
       if (!job.openCodeSessionId) return false;
       if (!isTerminalJob(job.status)) return true;
-      const total = sumUsage(state.stageRuns.filter((run) => run.jobId === job.id).map((run) => run.usage)).total;
-      return total === 0;
+      const usage = sumUsage(state.stageRuns.filter((run) => run.jobId === job.id && this.isCurrentRevision(job, run.revision)).map((run) => run.usage));
+      return usage.input + usage.output + usage.reasoning + usage.cacheRead + usage.cacheWrite === 0;
     }));
   }
 
@@ -549,10 +697,10 @@ export class CadirService {
       const job = state.jobs.find((item) => item.id === jobId);
       if (!job) return [];
       const runs = state.stageRuns.filter((item) => item.jobId === jobId);
-      const runningIndex = [...runs].reverse().findIndex((item) => item.status === "running");
-      const runIndex = runningIndex >= 0 ? runs.length - 1 - runningIndex : runs.length - 1;
-      const run = runs[runIndex];
+      const currentRuns = this.currentStageRuns(state, job);
+      const run = [...currentRuns].reverse().find((item) => item.status === "running") ?? currentRuns.at(-1);
       if (!run) return [];
+      const runIndex = runs.findIndex((item) => item.id === run.id);
       // Legacy StageRuns have no baseline; prior attempts are the closest safe approximation.
       const baseline = run.usageBaseline ?? sumUsage(runs.slice(0, runIndex).map((item) => item.usage));
       const delta = subtractUsage(subtractUsage(expected, baseline), run.usage);
@@ -563,7 +711,7 @@ export class CadirService {
         reasoning: run.usage.reasoning + delta.reasoning,
         cacheRead: run.usage.cacheRead + delta.cacheRead,
         cacheWrite: run.usage.cacheWrite + delta.cacheWrite,
-        total: run.usage.total + delta.total,
+        total: run.usage.input + delta.input + run.usage.output + delta.output + run.usage.reasoning + delta.reasoning,
       };
       return [this.appendEvent(state, job, "usage.updated", { stageRunId: run.id, usage: run.usage, cumulative: expected, baseline })];
     });
@@ -582,7 +730,7 @@ export class CadirService {
   private async appendAssistantDelta(jobId: string, delta: string): Promise<void> {
     const events = await this.store.transaction((state) => {
       const job = state.jobs.find((item) => item.id === jobId)!;
-      const run = [...state.stageRuns].reverse().find((item) => item.jobId === jobId && item.status === "running");
+      const run = [...state.stageRuns].reverse().find((item) => item.jobId === jobId && this.isCurrentRevision(job, item.revision) && item.status === "running");
       if (run) run.output = `${run.output ?? ""}${delta}`;
       let message = [...state.messages].reverse().find((item) => item.jobId === jobId && item.role === "assistant" && !item.completedAt);
       const emitted: JobEvent[] = [];
@@ -621,14 +769,14 @@ export class CadirService {
       if (isTerminalJob(job.status)) {
         if (!refineTerminal || job.status !== "failed" || job.error?.detail === error.detail) return [];
         job.error = error;
-        const failedRun = [...state.stageRuns].reverse().find((item) => item.jobId === job.id && item.status === "failed");
+        const failedRun = [...state.stageRuns].reverse().find((item) => item.jobId === job.id && this.isCurrentRevision(job, item.revision) && item.status === "failed");
         if (failedRun) failedRun.error = error;
         job.updatedAt = now();
         this.touchConversation(state, job);
         return [this.appendEvent(state, job, "job.failed", { error, refined: true })];
       }
       const timestamp = now(); job.status = "failed"; job.error = error; job.updatedAt = timestamp; job.completedAt = timestamp;
-      for (const run of state.stageRuns.filter((item) => item.jobId === job.id && item.status === "running")) { run.status = "failed"; run.completedAt = timestamp; run.error = error; }
+      for (const run of state.stageRuns.filter((item) => item.jobId === job.id && this.isCurrentRevision(job, item.revision) && item.status === "running")) { run.status = "failed"; run.completedAt = timestamp; run.error = error; }
       this.touchConversation(state, job);
       return [this.appendEvent(state, job, "job.failed", { error })];
     });
@@ -701,8 +849,9 @@ export class CadirService {
   }
 
   private async assertStageArtifacts(state: DatabaseState, jobId: string, stage: Stage, stageRunId: string): Promise<void> {
-    const artifacts = state.artifacts.filter((item) => item.jobId === jobId && item.validated);
-    const has = (suffix: string): boolean => artifacts.some((item) => item.name.toLowerCase().endsWith(suffix.toLowerCase()));
+    const job = state.jobs.find((item) => item.id === jobId);
+    if (!job) throw notFound("job");
+    const artifacts = state.artifacts.filter((item) => item.jobId === jobId && this.isCurrentRevision(job, item.revision) && item.validated);
     if (stage === "requirements") {
       const requirements = artifacts.find((item) => item.name === "requirements.md" && item.kind === "requirements");
       if (!requirements) throw new AppError(409, "REQUIREMENTS_MISSING", "validated requirements.md is required");
@@ -760,7 +909,9 @@ export class CadirService {
   }
 
   private assertPublishArtifacts(state: DatabaseState, jobId: string): void {
-    const artifacts = state.artifacts.filter((item) => item.jobId === jobId && item.validated);
+    const job = state.jobs.find((item) => item.id === jobId);
+    if (!job) throw notFound("job");
+    const artifacts = state.artifacts.filter((item) => item.jobId === jobId && this.isCurrentRevision(job, item.revision) && item.validated);
     const names = new Set(artifacts.filter((item) => !item.partial).map((item) => item.name.toLowerCase()));
     const required = [
       "requirements.md", "model.py", "model.json", "model.step", "model.stl", "model.fcstd", "manifest.json",
@@ -841,12 +992,12 @@ export class CadirService {
   }
 
   private async archiveEvolution(state: DatabaseState, job: Job, transitionSummary?: string): Promise<RagArchiveEntry> {
-    const existing = state.ragEntries.find((item) => item.sourceJobId === job.id);
-    if (existing) return existing;
     const conversation = state.conversations.find((item) => item.id === job.conversationId);
     if (!conversation) throw notFound("conversation");
+    const revision = this.jobRevision(job);
+    const existing = state.ragEntries.find((item) => item.sourceJobId === job.id);
     const latestArtifact = (name: string): Artifact | undefined => [...state.artifacts].reverse().find((item) =>
-      item.jobId === job.id && item.validated && !item.partial && item.name.toLowerCase() === name.toLowerCase());
+      item.jobId === job.id && this.isCurrentRevision(job, item.revision) && item.validated && !item.partial && item.name.toLowerCase() === name.toLowerCase());
     const required: Array<{ name: string; mimeType: string }> = [
       { name: "model.py", mimeType: "text/x-python" },
       { name: "model.json", mimeType: "application/json" },
@@ -864,29 +1015,11 @@ export class CadirService {
     const entriesRoot = resolve(this.config.ragLibraryRoot, "entries");
     const finalPath = resolve(entriesRoot, job.id);
     this.assertChildPath(this.config.ragLibraryRoot, finalPath);
-    try {
-      const archived = JSON.parse(await readFile(resolve(finalPath, "manifest.json"), "utf8")) as RagManifest;
-      if (archived.sourceJobId !== job.id) throw new Error("archive entry source mismatch");
-      const manifestPath = resolve(finalPath, "manifest.json");
-      const manifestStat = await stat(manifestPath);
-      const files: RagArchiveFile[] = [...archived.files, {
-        name: "manifest.json", relativePath: "manifest.json", mimeType: "application/json",
-        size: manifestStat.size, sha256: await this.sha256File(manifestPath),
-      }];
-      const recovered: RagArchiveEntry = {
-        id: job.id, sourceConversationId: job.conversationId, sourceJobId: job.id,
-        sourceTitle: conversation.title, path: finalPath, summary: archived.summary, files, createdAt: archived.createdAt,
-      };
-      state.ragEntries.push(recovered);
-      return recovered;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        throw new AppError(500, "RAG_ARCHIVE_INVALID", "existing RAG archive entry is invalid");
-      }
-    }
-
     const temporaryPath = resolve(entriesRoot, `.tmp-${job.id}-${randomUUID()}`);
+    const stagedPath = resolve(entriesRoot, `.next-${job.id}-${randomUUID()}`);
     this.assertChildPath(this.config.ragLibraryRoot, temporaryPath);
+    this.assertChildPath(this.config.ragLibraryRoot, stagedPath);
+    let backupPath: string | undefined;
     await mkdir(temporaryPath, { recursive: true });
     try {
       const files: RagArchiveFile[] = [];
@@ -906,15 +1039,26 @@ export class CadirService {
         try { validation = (JSON.parse(await readFile(publishManifest.path, "utf8")) as Record<string, unknown>).validation; }
         catch { /* The publish guard already validates the manifest's presence. */ }
       }
-      const createdAt = now();
+      const createdAt = existing?.createdAt ?? now();
+      const updatedAt = now();
       const manifest: RagManifest = {
         schemaVersion: 1, id: job.id, sourceConversationId: job.conversationId, sourceJobId: job.id,
-        sourceTitle: conversation.title, createdAt, summary: summary || transitionSummary || job.summary || "CAD model archived",
+        sourceTitle: conversation.title, revision, createdAt, updatedAt,
+        summary: summary || transitionSummary || job.summary || "CAD model archived",
         transitionSummary, validation, files,
       };
       await writeFile(resolve(temporaryPath, "manifest.json"), JSON.stringify(manifest, null, 2), "utf8");
       await mkdir(entriesRoot, { recursive: true });
-      await rename(temporaryPath, finalPath);
+      await rename(temporaryPath, stagedPath);
+      try {
+        await stat(finalPath);
+        backupPath = resolve(entriesRoot, `.previous-${job.id}-${randomUUID()}`);
+        this.assertChildPath(this.config.ragLibraryRoot, backupPath);
+        await rename(finalPath, backupPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      await rename(stagedPath, finalPath);
       const manifestPath = resolve(finalPath, "manifest.json");
       const manifestFile = await stat(manifestPath);
       const archiveFiles = [...files, {
@@ -923,12 +1067,20 @@ export class CadirService {
       }];
       const entry: RagArchiveEntry = {
         id: job.id, sourceConversationId: job.conversationId, sourceJobId: job.id,
-        sourceTitle: conversation.title, path: finalPath, summary: manifest.summary, files: archiveFiles, createdAt,
+        sourceTitle: conversation.title, path: finalPath, summary: manifest.summary, files: archiveFiles, createdAt, revision, updatedAt,
       };
-      state.ragEntries.push(entry);
+      const existingIndex = state.ragEntries.findIndex((item) => item.sourceJobId === job.id);
+      if (existingIndex >= 0) state.ragEntries[existingIndex] = entry;
+      else state.ragEntries.push(entry);
+      if (backupPath) await rm(backupPath, { recursive: true, force: true }).catch(() => undefined);
       return entry;
     } catch (error) {
       await rm(temporaryPath, { recursive: true, force: true }).catch(() => undefined);
+      await rm(stagedPath, { recursive: true, force: true }).catch(() => undefined);
+      if (backupPath) {
+        await rm(finalPath, { recursive: true, force: true }).catch(() => undefined);
+        await rename(backupPath, finalPath).catch(() => undefined);
+      }
       if (error instanceof AppError) throw error;
       throw new AppError(500, "RAG_ARCHIVE_FAILED", this.safeError(error));
     }
@@ -967,6 +1119,7 @@ export class CadirService {
 
   private touchConversation(state: DatabaseState, job: Job): void {
     const conversation = state.conversations.find((item) => item.id === job.conversationId)!;
+    conversation.jobId = job.id;
     conversation.latestJobId = job.id; conversation.latestJobStatus = job.status; conversation.updatedAt = now(); conversation.revision += 1;
   }
 
@@ -997,7 +1150,9 @@ interface RagManifest {
   sourceConversationId: string;
   sourceJobId: string;
   sourceTitle: string;
+  revision?: number;
   createdAt: string;
+  updatedAt?: string;
   summary: string;
   transitionSummary?: string;
   validation?: unknown;

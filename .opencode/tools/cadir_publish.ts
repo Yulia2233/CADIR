@@ -5,7 +5,7 @@ import { callRuntime, postInternal, type ToolContext } from "../lib/cadir"
 
 export default tool({
   description:
-    "Publish the latest complete CAD run after visual feedback. Registers the immutable artifact manifest with the backend.",
+    "Publish the latest complete CAD revision after visual feedback. Registers the current artifact manifest so the backend can replace the previous successful archive.",
   args: {},
   async execute(_args, context) {
     const typedContext = context as ToolContext

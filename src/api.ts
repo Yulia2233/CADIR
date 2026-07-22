@@ -46,6 +46,7 @@ export interface Job {
   modelId?: string;
   modelProvider?: string;
   effort?: ModelEffort;
+  revision?: number;
 }
 
 export interface ModelOption {
@@ -73,6 +74,7 @@ export interface StageRun {
   stage: StageKey;
   status: StageStatus;
   attempt: number;
+  revision?: number;
   summary?: string;
   startedAt?: string;
   completedAt?: string;
@@ -117,6 +119,7 @@ export interface Artifact {
   id: string;
   jobId: string;
   stageRunId?: string;
+  revision?: number;
   kind?: string;
   type?: string;
   format?: string;

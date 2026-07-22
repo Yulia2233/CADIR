@@ -97,14 +97,20 @@ subagent and never perform retrieval or web search.
 
 ## Continuous state flow
 
-Use `cadir_stage` at every phase boundary. The backend creates the initial
-`requirements: running` state and automatically starts the next stage after an
-accepted `complete`; do not self-report `running`. The tool is a transition
-request only, and the backend validates artifacts and persists authoritative
-state.
+Use `cadir_stage` at every phase boundary. For the first request in a CADIR
+session, the backend creates `requirements: running`. For a later user-requested
+modification in the same session, the backend creates a new revision directly
+at `codegen: running`; in that case read the existing `requirements.md`,
+`model.py`, `model.json`, `summary.md`, and `experience.md`, preserve the current
+model as the baseline, and do not call the requirements stage. The backend
+automatically starts the next stage after an accepted `complete`; do not
+self-report `running`. The tool is a transition request only, and the backend
+validates artifacts and persists authoritative state.
 
-1. Analyze the request and any provided images, write `requirements.md`, then
-   call `cadir_stage(requirements, complete)`.
+1. On the first request only, analyze the request and any provided images, write
+   `requirements.md`, then call `cadir_stage(requirements, complete)`. When the
+   backend starts a modification at codegen, skip this step and apply the user's
+   change directly to the existing model.
 2. Write `model.py`, call `cadir_run`, and call `cadir_stage(codegen, complete)`
    only after the runtime succeeds.
 3. In the automatically started `visual` stage, call `cadir_image` for isometric, front,
@@ -119,15 +125,18 @@ state.
    fork work.
 5. Repeat codegen -> visual until the model passes. On pass, call
    `cadir_stage(visual, complete)`. The backend starts one final `evolution`
-   review. Write `summary.md` and `experience.md` in the job root before
-   publishing. `summary.md` must concisely record the normalized requirement,
-   final geometry and dimensions, validation measurements, and visual result.
-   `experience.md` must record reusable modeling choices, SimpleCADAPI calls
-   that worked, execution or visual failures and their repairs, verification
-   strategy, and known limitations. These documents must contain engineering
-   conclusions only, never hidden reasoning or chain-of-thought. Summarize the
-   completed revisions (or state that no correction was needed), call
-   `cadir_publish` exactly once, and only then call
+   review. Before overwriting them, read any existing `summary.md` and
+   `experience.md`. Rewrite both files as cumulative documents for the current
+   final model. `summary.md` must concisely record the original normalized
+   requirement, every completed user-requested modification in order, final
+   geometry and dimensions, validation measurements, and visual result. It must
+   describe the consolidated final state rather than merely concatenate old
+   prose. `experience.md` must retain still-relevant experience from earlier
+   revisions and add reusable modeling choices, SimpleCADAPI calls that worked,
+   execution or visual failures and their repairs, verification strategy, and
+   known limitations from the current revision. These documents must contain
+   engineering conclusions only, never hidden reasoning or chain-of-thought.
+   Call `cadir_publish` exactly once per revision, and only then call
    `cadir_stage(evolution, complete)`. Because the latest visual attempt passed,
    this final transition validates STEP/STL/FCStd, `manifest.json`, both
    knowledge documents, and the independent RAG archive before marking the job
@@ -139,7 +148,8 @@ state.
    stop for the user's answer. If the task cannot continue, report the phase as
    `failed` with the exact concise error.
 
-The final assistant message must be a short completion summary followed by the
-exact paths from the publish manifest for `requirements.md`, `model.py`, `.step`,
-`.stl`, `.FCStd`, canonical `model.json`, and all rendered images. Do not invent
-or shorten paths.
+The final assistant message for each revision must be a short completion summary
+covering the consolidated final model and the changes completed in that
+revision, followed by the exact paths from the publish manifest for
+`requirements.md`, `model.py`, `.step`, `.stl`, `.FCStd`, canonical `model.json`,
+and all rendered images. Do not invent or shorten paths.

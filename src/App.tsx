@@ -65,10 +65,11 @@ function normalizeSnapshot(snapshot: JobSnapshot): JobSnapshot {
   const emptyUsage = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
   return {
     ...snapshot,
+    job: { ...snapshot.job, revision: snapshot.job.revision ?? 1 },
     lastSeq: Number(snapshot.lastSeq ?? 0),
-    stageRuns: Array.isArray(snapshot.stageRuns) ? snapshot.stageRuns.map((stage) => ({ ...stage, usage: stage.usage ?? { ...emptyUsage } })) : [],
+    stageRuns: Array.isArray(snapshot.stageRuns) ? snapshot.stageRuns.map((stage) => ({ ...stage, revision: stage.revision ?? 1, usage: stage.usage ?? { ...emptyUsage } })) : [],
     messages: Array.isArray(snapshot.messages) ? snapshot.messages.map((message) => ({ ...message, imageArtifactIds: message.imageArtifactIds ?? [] })) : [],
-    artifacts: Array.isArray(snapshot.artifacts) ? snapshot.artifacts : [],
+    artifacts: Array.isArray(snapshot.artifacts) ? snapshot.artifacts.map((artifact) => ({ ...artifact, revision: artifact.revision ?? 1 })) : [],
     usage: snapshot.usage ?? emptyUsage,
   };
 }
@@ -94,14 +95,18 @@ function reduceStreamEvent(current: JobSnapshot | null, event: StreamEvent): Job
     const candidate = (data.stageRun && typeof data.stageRun === "object" ? data.stageRun : data) as Partial<StageRun>;
     const key = candidate.stage;
     if (key) {
-      const proposedId = candidate.id ?? `${key}-${candidate.attempt ?? 1}`;
-      const index = next.stageRuns.findIndex((stage) => stage.id === proposedId || (stage.stage === key && stage.attempt === (candidate.attempt ?? stage.attempt)));
+      const proposedId = candidate.id ?? String(data.stageRunId ?? `${key}-${candidate.attempt ?? 1}`);
+      const candidateRevision = Number(candidate.revision ?? data.revision ?? next.job.revision ?? 1);
+      const index = next.stageRuns.findIndex((stage) => stage.id === proposedId || (
+        stage.stage === key && stage.attempt === (candidate.attempt ?? stage.attempt) && (stage.revision ?? 1) === candidateRevision
+      ));
       const id = index >= 0 ? next.stageRuns[index].id : proposedId;
       const merged = {
         ...(index >= 0 ? next.stageRuns[index] : { id, jobId: next.job.id, stage: key, status: "running", attempt: candidate.attempt ?? 1, usage: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }),
         ...candidate,
         id,
         stage: key,
+        revision: candidateRevision,
       } as StageRun;
       if (index >= 0) next.stageRuns[index] = merged;
       else next.stageRuns.push(merged);
@@ -129,7 +134,7 @@ function reduceStreamEvent(current: JobSnapshot | null, event: StreamEvent): Job
 
     const stageKey = (data.stage ?? next.job.currentStage) as StageKey | undefined;
     if (event.type === "message.delta" && stageKey && delta) {
-      const stageIndex = [...next.stageRuns].reverse().findIndex((stage) => stage.stage === stageKey);
+      const stageIndex = [...next.stageRuns].reverse().findIndex((stage) => stage.stage === stageKey && (stage.revision ?? 1) === (next.job.revision ?? 1));
       if (stageIndex >= 0) {
         const actualIndex = next.stageRuns.length - 1 - stageIndex;
         const stage = next.stageRuns[actualIndex];
@@ -143,7 +148,7 @@ function reduceStreamEvent(current: JobSnapshot | null, event: StreamEvent): Job
     const text = String(data.summary ?? data.message ?? data.output ?? "");
     const toolError = data.error && typeof data.error === "object" ? data.error as StageRun["toolError"] : undefined;
     if (stageKey && (text || toolError || data.clearToolError === true)) {
-      const index = [...next.stageRuns].reverse().findIndex((stage) => stage.stage === stageKey);
+      const index = [...next.stageRuns].reverse().findIndex((stage) => stage.stage === stageKey && (stage.revision ?? 1) === (next.job.revision ?? 1));
       if (index >= 0) {
         const actualIndex = next.stageRuns.length - 1 - index;
         const stage = next.stageRuns[actualIndex];
@@ -177,7 +182,10 @@ function reduceStreamEvent(current: JobSnapshot | null, event: StreamEvent): Job
     }
   }
 
-  if (event.type === "job.started") next.job.status = "running";
+  if (event.type === "job.started") {
+    next.job.status = "running";
+    if (typeof data.revision === "number") next.job.revision = data.revision;
+  }
   if (event.type === "job.needs_input") next.job.status = "waiting_input";
   if (event.type === "job.needs_input" && typeof data.summary === "string") next.job.summary = data.summary;
   if (event.type === "job.completed") {
@@ -190,6 +198,7 @@ function reduceStreamEvent(current: JobSnapshot | null, event: StreamEvent): Job
     const error = (data.error && typeof data.error === "object" ? data.error : data) as NonNullable<JobSnapshot["job"]["error"]>;
     next.job.error = { ...error, code: error.code ?? "OPENCODE_ERROR", message: error.message ?? "任务执行失败" };
   }
+  if (typeof data.revision === "number") next.job.revision = data.revision;
   next.job.updatedAt = event.timestamp ?? next.job.updatedAt;
   return next;
 }
@@ -282,11 +291,11 @@ function artifactIsStl(artifact: Artifact) {
   return format.includes("stl");
 }
 
-function latestOutputArtifacts(artifacts: Artifact[]) {
+function latestOutputArtifacts(artifacts: Artifact[], revision?: number) {
   const outputs = /^(requirements\.md|model\.(py|json|step|stl|fcstd)|manifest\.json|render-(isometric|front|top|right)\.png)$/i;
   const latest = new Map<string, Artifact>();
   [...artifacts]
-    .filter((artifact) => artifact.validated === true && artifact.partial !== true && outputs.test(artifact.name))
+    .filter((artifact) => artifact.validated === true && artifact.partial !== true && (artifact.revision ?? 1) === (revision ?? 1) && outputs.test(artifact.name))
     .sort((left, right) => String(left.createdAt ?? "").localeCompare(String(right.createdAt ?? "")))
     .forEach((artifact) => latest.set(artifact.name.toLowerCase(), artifact));
   return [...latest.values()];
@@ -354,6 +363,7 @@ export default function App() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pendingImagesRef = useRef<PendingImage[]>([]);
+  const streamControllerRef = useRef<JobStreamController | null>(null);
   const activeSession = sessions.find((session) => session.id === activeId);
 
   useEffect(() => {
@@ -468,8 +478,12 @@ export default function App() {
       },
       onTerminal: () => void refreshSessions(),
     });
+    streamControllerRef.current = controller;
     controller.start();
-    return () => controller.stop();
+    return () => {
+      if (streamControllerRef.current === controller) streamControllerRef.current = null;
+      controller.stop();
+    };
   }, [activeJobId, refreshSessions]);
 
   useEffect(() => {
@@ -503,8 +517,10 @@ export default function App() {
   const visiblyRunning = serverRunning && connection === "connected";
   const totalTokens = snapshot?.usage.total ?? 0;
   const inputImageIds = new Set(messages.filter((message) => message.role === "user").flatMap((message) => message.imageArtifactIds ?? []));
-  const generatedImages = (snapshot?.artifacts ?? []).filter((artifact) => artifactIsImage(artifact) && !inputImageIds.has(artifact.id));
-  const finalArtifacts = latestOutputArtifacts(snapshot?.artifacts ?? []);
+  const currentRevision = snapshot?.job.revision ?? 1;
+  const finalArtifacts = latestOutputArtifacts(snapshot?.artifacts ?? [], currentRevision);
+  const currentArtifacts = (snapshot?.artifacts ?? []).filter((artifact) => (artifact.revision ?? 1) === currentRevision);
+  const generatedImages = currentArtifacts.filter((artifact) => artifactIsImage(artifact) && !inputImageIds.has(artifact.id));
   const validatedStl = [...(snapshot?.artifacts ?? [])]
     .filter((artifact) => artifactIsStl(artifact) && artifact.validated === true && artifact.partial !== true)
     .sort((a, b) => String(a.createdAt ?? "").localeCompare(String(b.createdAt ?? "")))
@@ -622,7 +638,8 @@ export default function App() {
       setInput("");
       clearPendingImages();
       if (response.snapshot) setSnapshot(normalizeSnapshot(response.snapshot));
-      setActiveJobId(response.jobId);
+      if (response.jobId === activeJobId) streamControllerRef.current?.recoverNow();
+      else setActiveJobId(response.jobId);
       await refreshSessions();
     } catch (error) {
       setConnection("error");
@@ -922,7 +939,7 @@ export default function App() {
               ))}
             </div>
           </fieldset>
-          <p className="settings-note">设置只会应用到下一次新任务，正在运行的任务不会切换模型。</p>
+          <p className="settings-note">设置会应用到下一次新建或修改请求，正在运行的任务不会切换模型。</p>
           {settingsError && <div className="settings-error"><CircleAlert size={14} /> {settingsError}</div>}
           <div className="settings-footer">
             <span className={`settings-state ${settingsStatus}`}>{settingsStatus === "loading" ? "正在读取" : settingsStatus === "saving" ? "正在保存" : settingsStatus === "saved" ? "已保存" : settingsStatus === "error" ? "保存失败" : ""}</span>

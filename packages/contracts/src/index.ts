@@ -42,6 +42,8 @@ export interface Conversation {
   openCodeSessionId?: string;
   latestJobId?: string;
   latestJobStatus?: JobStatus;
+  /** Stable one-to-one job mapping for this conversation. */
+  jobId?: string;
   deletionStatus?: "deleting" | "failed";
   deletionError?: string;
   revision: number;
@@ -66,6 +68,9 @@ export interface RagArchiveEntry {
   summary: string;
   files: RagArchiveFile[];
   createdAt: string;
+  /** Revision of the last successful model archived for this job. */
+  revision?: number;
+  updatedAt?: string;
 }
 
 export interface JobError {
@@ -94,6 +99,8 @@ export interface Job {
   modelId?: string;
   modelProvider?: string;
   effort?: ModelEffort;
+  /** Incremented for each user-requested modification of the same job. */
+  revision?: number;
 }
 
 export interface StageRun {
@@ -101,6 +108,8 @@ export interface StageRun {
   jobId: string;
   stage: Stage;
   attempt: number;
+  /** Modification revision that owns this stage attempt. */
+  revision?: number;
   status: StageStatus;
   summary?: string;
   output?: string;
@@ -129,6 +138,8 @@ export interface Artifact {
   id: string;
   jobId: string;
   stageRunId?: string;
+  /** Modification revision that produced this artifact. */
+  revision?: number;
   name: string;
   kind: ArtifactKind;
   path: string;

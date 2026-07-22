@@ -109,7 +109,7 @@ test("OpenCode part events resolve the job through part.sessionID", async () => 
   assert.equal(service.eventsAfter(initial.job.id, 0).some((event) => event.type === "message.delta"), true);
 });
 
-test("usage reconciliation accumulates assistant messages once and includes cache tokens", async () => {
+test("usage reconciliation retains cache metrics without counting them in total", async () => {
   const { service } = await fixture();
   const conversation = await service.createConversation();
   const initial = await service.submitMessage(conversation.id, { content: "Create a plate" });
@@ -121,7 +121,7 @@ test("usage reconciliation accumulates assistant messages once and includes cach
   await service.reconcileUsage(initial.job.id, messages);
   await service.reconcileUsage(initial.job.id, messages);
   const snapshot = service.getSnapshot(initial.job.id);
-  assert.deepEqual(snapshot.usage, { input: 110, output: 24, reasoning: 6, cacheRead: 58, cacheWrite: 2, total: 200 });
+  assert.deepEqual(snapshot.usage, { input: 110, output: 24, reasoning: 6, cacheRead: 58, cacheWrite: 2, total: 140 });
   assert.equal(service.eventsAfter(initial.job.id, 0).filter((event) => event.type === "usage.updated").length, 1);
 });
 
@@ -140,10 +140,10 @@ test("stage retries subtract the OpenCode usage baseline", async () => {
 
   const snapshot = service.getSnapshot(initial.job.id);
   assert.deepEqual(snapshot.stageRuns.map((run) => run.usage), [
-    { input: 100, output: 20, reasoning: 5, cacheRead: 50, cacheWrite: 0, total: 175 },
-    { input: 12, output: 4, reasoning: 1, cacheRead: 8, cacheWrite: 0, total: 25 },
+    { input: 100, output: 20, reasoning: 5, cacheRead: 50, cacheWrite: 0, total: 125 },
+    { input: 12, output: 4, reasoning: 1, cacheRead: 8, cacheWrite: 0, total: 17 },
   ]);
-  assert.deepEqual(snapshot.stageRuns[1].usageBaseline, { input: 100, output: 20, reasoning: 5, cacheRead: 50, cacheWrite: 0, total: 175 });
+  assert.deepEqual(snapshot.stageRuns[1].usageBaseline, { input: 100, output: 20, reasoning: 5, cacheRead: 50, cacheWrite: 0, total: 125 });
 });
 
 test("terminal jobs with zero usage are reconciled by the supervisor", async () => {
@@ -154,7 +154,7 @@ test("terminal jobs with zero usage are reconciled by the supervisor", async () 
   adapter.messageList = [{ info: { role: "assistant", tokens: { input: 30, output: 7, cache: { read: 12 }, total: 49 } } }];
   const supervisor = new OpenCodeEventSupervisor(service, adapter, config);
   await (supervisor as any).tick();
-  assert.equal(service.getSnapshot(initial.job.id).usage.total, 49);
+  assert.equal(service.getSnapshot(initial.job.id).usage.total, 37);
   assert.equal(service.usageReconciliationJobs().some((job) => job.id === initial.job.id), false);
 });
 
@@ -374,7 +374,7 @@ test("an uploaded reference image cannot satisfy the visual feedback guard", asy
 });
 
 test("final evolution transition is the authoritative completion boundary", async () => {
-  const { service, jobsRoot, store } = await fixture();
+  const { service, jobsRoot, store, adapter } = await fixture();
   const conversation = await service.createConversation();
   const initial = await service.submitMessage(conversation.id, { content: "Create a spacer" });
   const directory = join(jobsRoot, initial.job.id);
@@ -411,6 +411,35 @@ test("final evolution transition is the authoritative completion boundary", asyn
     "render-right.png", "render-top.png", "summary.md",
   ]);
   assert.equal(JSON.parse(await readFile(join(archive.path, "manifest.json"), "utf8")).sourceJobId, manifest.jobId);
+
+  adapter.messageList = [{ info: { role: "assistant", tokens: { input: 20, output: 10, total: 30 } } }];
+  const modification = await service.submitMessage(conversation.id, { content: "Add a shallow groove to the spacer" });
+  assert.equal(modification.job.id, initial.job.id, "a Session must keep one stable Job");
+  assert.equal(modification.job.revision, 2);
+  assert.equal(modification.job.currentStage, "codegen", "modifications start at codegen");
+  assert.equal(modification.stageRuns.find((run) => run.revision === 2)?.usageBaseline?.total, 30);
+  assert.equal(adapter.prompts.at(-1)?.sessionId, "session-1", "the OpenCode conversation is reused");
+  assert.match(adapter.prompts.at(-1)?.content ?? "", /modification request/i);
+  await add("model.py", "python");
+  await add("model.json", "other");
+  await service.transition({ sessionID: "session-1", stage: "codegen", action: "complete" });
+  for (const name of ["render-isometric.png", "render-front.png", "render-top.png", "render-right.png"]) await add(name, "image");
+  await service.transition({ sessionID: "session-1", stage: "visual", action: "complete", summary: "Updated visual review" });
+  await add("model.step", "step");
+  await add("model.stl", "stl");
+  await add("model.FCStd", "freecad");
+  await writeFile(join(directory, "summary.md"), "summary revision 2");
+  await writeFile(join(directory, "experience.md"), "experience revisions 1 and 2");
+  await service.registerArtifact({ sessionID: "session-1", path: join(directory, "summary.md"), kind: "summary", validated: true });
+  await service.registerArtifact({ sessionID: "session-1", path: join(directory, "experience.md"), kind: "experience", validated: true });
+  await add("manifest.json", "other");
+  const secondComplete = await service.transition({ sessionID: "session-1", stage: "evolution", action: "skipped", summary: "Updated model published" });
+  assert.equal(secondComplete.job.status, "completed");
+  const updatedArchive = store.read((state) => state.ragEntries.filter((entry) => entry.sourceJobId === initial.job.id));
+  assert.equal(updatedArchive.length, 1, "a Job must have one replaceable RAG Case");
+  assert.equal(updatedArchive[0].revision, 2);
+  assert.equal(await readFile(join(updatedArchive[0].path, "summary.md"), "utf8"), "summary revision 2");
+  assert.equal(JSON.parse(await readFile(join(updatedArchive[0].path, "manifest.json"), "utf8")).revision, 2);
 
   const deleted = await service.deleteConversation(conversation.id);
   assert.equal(deleted.retainedRagEntries, 1);
