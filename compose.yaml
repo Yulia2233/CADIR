@@ -51,6 +51,10 @@ services:
       OPENCODE_AGENT: cadir-agent
       OPENCODE_MODEL_PROVIDER: cadir
       CADIR_MODEL_ID: gpt-5.6-sol
+      RETRIEVAL_URL: ${RETRIEVAL_URL:-http://retrieval-api:8000}
+      RETRIEVAL_INTERNAL_TOKEN: ${INTERNAL_API_TOKEN:?set INTERNAL_API_TOKEN in .env}
+      RETRIEVAL_TIMEOUT_MS: ${RETRIEVAL_TIMEOUT_MS:-30000}
+      RETRIEVAL_TOP_K: ${RETRIEVAL_TOP_K:-5}
     volumes:
       - cadir-data:/data
       - cadir-jobs:/workspace/jobs
@@ -81,3 +85,7 @@ volumes:
   cadir-jobs:
   cadir-rag-library:
   opencode-data:
+
+networks:
+  default:
+    name: cadir-internal

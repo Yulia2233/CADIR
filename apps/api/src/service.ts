@@ -1,17 +1,25 @@
 import { createReadStream } from "node:fs";
 import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
-import { basename, extname, resolve, sep } from "node:path";
+import { basename, extname, relative, resolve, sep } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import {
+  DEFAULT_SUBGRAPH_MAX_NODES, MAX_SUBGRAPH_MAX_NODES, MIN_SUBGRAPH_MAX_NODES, RETRIEVAL_MODES, RETRIEVAL_POOLS,
   emptyUsage, isTerminalJob,
   type Artifact, type ArtifactKind, type Conversation, type CreateMessageRequest,
   type Job, type JobError, type JobEvent, type JobSnapshot, type RagArchiveEntry, type RagArchiveFile,
-  type ModelEffort, type ModelOption, type ModelSettings, type ModelSettingsResponse,
-  type Stage, type StageRun, type StageTransitionRequest, type TokenUsage, type Upload,
+  type ModelEffort, type ModelOption, type ModelSettings, type ModelSettingsResponse, type RetrievalMode, type RetrievalPool, type RetrievalSource,
+  type Stage, type StageRun, type StageTransitionRequest, type TokenUsage, type ToolActivity, type Upload,
 } from "../../../packages/contracts/src/index.js";
 import type { AppConfig } from "./config.js";
 import { AppError, notFound } from "./errors.js";
 import type { OpenCodeAdapter, OpenCodeEvent } from "./opencode.js";
+import {
+  createRetrievalAdapter,
+  type RetrievalAdapter,
+  type RetrievalCaseResult,
+  type RetrievalQueryOptions,
+  type RetrievalResponse,
+} from "./retrieval.js";
 import { JsonStore } from "./store.js";
 import type { DatabaseState } from "./types.js";
 
@@ -25,6 +33,14 @@ const modelLabels: Record<string, string> = {
 };
 const modelIds = new Set(Object.keys(modelLabels));
 const effortIds: ModelEffort[] = ["low", "medium", "high"];
+const retrievalModeIds = new Set<RetrievalMode>(RETRIEVAL_MODES);
+const retrievalPoolIds = new Set<RetrievalPool>(RETRIEVAL_POOLS);
+
+function retrievalSources(pool: RetrievalPool): RetrievalSource[] {
+  if (pool === "base") return ["base"];
+  if (pool === "dynamic") return ["dynamic"];
+  return ["base", "dynamic"];
+}
 
 function sumUsage(values: TokenUsage[]): TokenUsage {
   const summed = values.reduce((sum, item) => ({
@@ -78,11 +94,13 @@ function withoutCacheTotal(usage: TokenUsage): TokenUsage {
 
 export class CadirService {
   private readonly deletionTasks = new Map<string, Promise<DeleteConversationResult>>();
+  private readonly indexingTasks = new Map<string, Promise<void>>();
 
   constructor(
     readonly store: JsonStore,
     private readonly adapter: OpenCodeAdapter,
     private readonly config: AppConfig,
+    private readonly retrieval: RetrievalAdapter = createRetrievalAdapter(config),
   ) {}
 
   async createConversation(title = "New CAD session"): Promise<Conversation> {
@@ -138,6 +156,141 @@ export class CadirService {
     return { stage: run.stage, status: run.status, attempt: run.attempt, stageRunId: run.id, revision: run.revision ?? 1, ...data };
   }
 
+  private upsertToolActivity(state: DatabaseState, job: Job, activity: ToolActivity): StageRun | undefined {
+    const revision = this.jobRevision(job);
+    const existingRun = [...state.stageRuns].reverse().find((run) =>
+      run.jobId === job.id
+      && (run.revision ?? 1) === revision
+      && run.toolActivities?.some((item) => item.id === activity.id),
+    );
+    const currentRun = existingRun ?? [...state.stageRuns].reverse().find((run) =>
+      run.jobId === job.id
+      && (run.revision ?? 1) === revision
+      && run.stage === job.currentStage,
+    );
+    if (!currentRun) return undefined;
+    if (activity.outputOffset === undefined) activity.outputOffset = currentRun.output?.length ?? 0;
+    const activities = currentRun.toolActivities ?? [];
+    const index = activities.findIndex((item) => item.id === activity.id);
+    if (index >= 0) activities[index] = { ...activities[index], ...activity };
+    else activities.push(activity);
+    currentRun.toolActivities = activities;
+    return currentRun;
+  }
+
+  private toolEventData(run: StageRun | undefined, activity: ToolActivity): Record<string, unknown> {
+    return {
+      activity,
+      tool: activity.tool,
+      stage: run?.stage,
+      stageRunId: run?.id,
+      revision: run?.revision ?? 1,
+    };
+  }
+
+  private compactText(value: unknown, limit = 360): string | undefined {
+    if (typeof value !== "string") return undefined;
+    const text = value.replace(/\s+/g, " ").trim();
+    if (!text) return undefined;
+    return text.length > limit ? `${text.slice(0, limit - 1)}...` : text;
+  }
+
+  private retrievedCaseSummary(value: Record<string, unknown>): string | undefined {
+    const metadata = value.metadata && typeof value.metadata === "object" ? value.metadata as Record<string, unknown> : undefined;
+    const content = value.content && typeof value.content === "object" ? value.content as Record<string, unknown> : undefined;
+    return this.compactText(value.summary ?? metadata?.summary ?? content?.summary);
+  }
+
+  private appendLegacyToolActivities(stageRuns: StageRun[], events: JobEvent[]): void {
+    const findRun = (timestamp: string): StageRun | undefined => {
+      const time = new Date(timestamp).getTime();
+      return [...stageRuns].reverse().find((run) => {
+        const started = new Date(run.startedAt).getTime();
+        const completed = run.completedAt ? new Date(run.completedAt).getTime() : Number.POSITIVE_INFINITY;
+        return started <= time && time <= completed + 1_000;
+      }) ?? [...stageRuns].reverse().find((run) => new Date(run.startedAt).getTime() <= time);
+    };
+    const push = (run: StageRun | undefined, activity: ToolActivity): void => {
+      if (!run) return;
+      run.toolActivities = [...(run.toolActivities ?? []), activity];
+    };
+
+    const hasRetrieval = stageRuns.some((run) => run.toolActivities?.some((item) => item.tool === "cadir_retrieve"));
+    if (!hasRetrieval) {
+      const starts = events.filter((event) => event.type === "retrieval.started" && !event.data.activity);
+      starts.forEach((started, index) => {
+        const nextSeq = starts[index + 1]?.seq ?? Number.POSITIVE_INFINITY;
+        const terminal = events.find((event) =>
+          event.seq > started.seq && event.seq < nextSeq
+          && (event.type === "retrieval.completed" || event.type === "retrieval.failed"),
+        );
+        const cases = Array.isArray(terminal?.data.cases) ? terminal.data.cases as Array<Record<string, unknown>> : [];
+        const summaries = cases
+          .map((item) => this.compactText(item.summary, 120))
+          .filter((item): item is string => Boolean(item))
+          .slice(0, 3);
+        const status = terminal?.type === "retrieval.failed" ? "failed" : terminal ? "completed" : "running";
+        push(findRun(started.timestamp), {
+          id: `legacy-retrieval-${started.eventId}`,
+          tool: "cadir_retrieve",
+          status,
+          orderSeq: started.seq,
+          query: this.compactText(started.data.query, 240),
+          resultCount: terminal?.type === "retrieval.completed" ? Number(terminal.data.returnedCount ?? cases.length) : undefined,
+          summary: this.compactText(summaries.join("；") || terminal?.data.detail),
+          startedAt: started.timestamp,
+          completedAt: terminal?.timestamp,
+        });
+      });
+    }
+
+    const hasCaseReads = stageRuns.some((run) => run.toolActivities?.some((item) => item.tool === "cadir_case_read"));
+    if (!hasCaseReads && !events.some((event) => event.type.startsWith("case.read."))) {
+      events
+        .filter((event) => event.type === "tool.updated"
+          && event.data.tool === "cadir_case_read"
+          && (event.data.status === "completed" || event.data.status === "error"))
+        .forEach((event) => push(findRun(event.timestamp), {
+          id: `legacy-case-read-${event.eventId}`,
+          tool: "cadir_case_read",
+          status: event.data.status === "error" ? "failed" : "completed",
+          orderSeq: event.seq,
+          summary: event.data.status === "error"
+            ? this.compactText((event.data.error as Record<string, unknown> | undefined)?.message)
+            : "已读取检索结果中的 CAD Case；旧任务未保存详细摘要。",
+          startedAt: event.timestamp,
+          completedAt: event.timestamp,
+        }));
+    }
+
+    for (const run of stageRuns) {
+      for (const activity of run.toolActivities ?? []) {
+        const anchor = events.find((event) =>
+          event.data.activity
+          && typeof event.data.activity === "object"
+          && (event.data.activity as Record<string, unknown>).id === activity.id
+          && (event.type === "retrieval.started" || event.type === "case.read.started"),
+        );
+        if (activity.orderSeq === undefined && anchor) activity.orderSeq = anchor.seq;
+        if (activity.outputOffset !== undefined) continue;
+        const anchorSeq = activity.orderSeq ?? anchor?.seq;
+        if (anchorSeq === undefined) {
+          activity.outputOffset = run.output?.length ?? 0;
+          continue;
+        }
+        const started = new Date(run.startedAt).getTime();
+        const completed = run.completedAt ? new Date(run.completedAt).getTime() : Number.POSITIVE_INFINITY;
+        activity.outputOffset = events
+          .filter((event) => {
+            if (event.type !== "message.delta" || event.seq >= anchorSeq) return false;
+            const timestamp = new Date(event.timestamp).getTime();
+            return started <= timestamp && timestamp <= completed + 1_000;
+          })
+          .reduce((length, event) => length + String(event.data.delta ?? "").length, 0);
+      }
+    }
+  }
+
   private modificationPrompt(content: string, workspacePath: string, uploads: Array<{ localPath: string }>): string {
     const images = uploads.length
       ? `\n\nAdditional reference images (read these exact paths):\n${uploads.map((item) => `- ${item.localPath}`).join("\n")}`
@@ -153,23 +306,257 @@ export class CadirService {
     ].join("\n\n") + images;
   }
 
+  private normalizeSettings(value?: Partial<ModelSettings>): ModelSettings {
+    const mode = value?.retrievalMode && retrievalModeIds.has(value.retrievalMode) ? value.retrievalMode : "full_and_subgraph";
+    const pool = value?.retrievalPool && retrievalPoolIds.has(value.retrievalPool) ? value.retrievalPool : "both";
+    const requestedNodes = Number(value?.subgraphMaxNodes ?? DEFAULT_SUBGRAPH_MAX_NODES);
+    const subgraphMaxNodes = Number.isSafeInteger(requestedNodes)
+      ? Math.min(MAX_SUBGRAPH_MAX_NODES, Math.max(MIN_SUBGRAPH_MAX_NODES, requestedNodes))
+      : DEFAULT_SUBGRAPH_MAX_NODES;
+    return {
+      modelId: value?.modelId ?? this.config.modelId,
+      effort: value?.effort && effortIds.includes(value.effort) ? value.effort : "medium",
+      retrievalMode: mode,
+      retrievalPool: pool,
+      subgraphMaxNodes,
+    };
+  }
+
+  private retrievalInstruction(settings: ModelSettings): string {
+    if (settings.retrievalMode === "none") {
+      return "CADIR retrieval is disabled for this revision. Do not call cadir_retrieve or cadir_case_read.";
+    }
+    const scope = settings.retrievalMode === "full" ? "complete CAD cases only" : `complete CAD cases plus 3D subgraphs with at most ${settings.subgraphMaxNodes} nodes`;
+    const pool = settings.retrievalPool === "base" ? "the base Case library only" : settings.retrievalPool === "dynamic" ? "the dynamic Case library only" : "both the base and dynamic Case libraries";
+    return `CADIR retrieval is enabled for ${scope}, using ${pool}. Before writing or repairing model.py, call cadir_retrieve with the current user request, inspect the unique Case summaries, and call cadir_case_read only for the most relevant one or two Cases.`;
+  }
+
   async getModelSettings(): Promise<ModelSettingsResponse> {
-    const settings = this.store.read((state) => state.modelSettings ?? { modelId: this.config.modelId, effort: "medium" as ModelEffort });
+    const settings = this.normalizeSettings(this.store.read((state) => state.modelSettings));
     const models = (await this.adapter.availableModels()).filter((item) => modelIds.has(item.id) && item.imageInput);
     return { settings, models, efforts: effortIds };
   }
 
   async updateModelSettings(input: Partial<ModelSettings>): Promise<ModelSettingsResponse> {
-    if (!input.modelId || !modelIds.has(input.modelId)) throw new AppError(400, "MODEL_NOT_ALLOWED", "model is not an allowed CADIR model");
-    if (!input.effort || !effortIds.includes(input.effort)) throw new AppError(400, "EFFORT_INVALID", "effort must be low, medium, or high");
+    const current = this.normalizeSettings(this.store.read((state) => state.modelSettings));
+    const requested = { ...current, ...input };
+    if (!modelIds.has(requested.modelId)) throw new AppError(400, "MODEL_NOT_ALLOWED", "model is not an allowed CADIR model");
+    if (!effortIds.includes(requested.effort)) throw new AppError(400, "EFFORT_INVALID", "effort must be low, medium, or high");
+    if (!retrievalModeIds.has(requested.retrievalMode)) throw new AppError(400, "RETRIEVAL_MODE_INVALID", "retrieval mode must be none, full, or full_and_subgraph");
+    if (!retrievalPoolIds.has(requested.retrievalPool)) throw new AppError(400, "RETRIEVAL_POOL_INVALID", "retrieval pool must be base, dynamic, or both");
+    const nodeLimit = Number(requested.subgraphMaxNodes);
+    if (!Number.isSafeInteger(nodeLimit) || nodeLimit < MIN_SUBGRAPH_MAX_NODES || nodeLimit > MAX_SUBGRAPH_MAX_NODES) {
+      throw new AppError(400, "SUBGRAPH_NODE_LIMIT_INVALID", `subgraphMaxNodes must be an integer from ${MIN_SUBGRAPH_MAX_NODES} to ${MAX_SUBGRAPH_MAX_NODES}`);
+    }
     const models = (await this.adapter.availableModels()).filter((item) => modelIds.has(item.id) && item.imageInput);
-    const selected = models.find((item) => item.id === input.modelId);
-    if (!selected) throw new AppError(409, "MODEL_UNAVAILABLE", "selected model is not currently available for image-enabled CAD tasks");
-    if (!selected.efforts.includes(input.effort)) throw new AppError(409, "EFFORT_UNAVAILABLE", "selected effort is not supported by this model");
+    const selected = models.find((item) => item.id === requested.modelId);
+    const modelChanged = requested.modelId !== current.modelId || requested.effort !== current.effort;
+    if (!selected && modelChanged) throw new AppError(409, "MODEL_UNAVAILABLE", "selected model is not currently available for image-enabled CAD tasks");
+    if (selected && !selected.efforts.includes(requested.effort)) throw new AppError(409, "EFFORT_UNAVAILABLE", "selected effort is not supported by this model");
     await this.store.transaction((state) => {
-      state.modelSettings = { modelId: input.modelId!, effort: input.effort! };
+      state.modelSettings = {
+        modelId: requested.modelId, effort: requested.effort, retrievalMode: requested.retrievalMode, retrievalPool: requested.retrievalPool, subgraphMaxNodes: nodeLimit,
+      };
     });
     return await this.getModelSettings();
+  }
+
+  async retrievalHealthy(): Promise<boolean> {
+    return await this.retrieval.health();
+  }
+
+  resumePendingIndexing(): void {
+    if (!this.config.retrievalUrl) return;
+    const jobIds = this.store.read((state) => state.ragEntries
+      .filter((entry) => entry.indexStatus !== "ready" || entry.indexedRevision !== entry.revision)
+      .map((entry) => entry.sourceJobId));
+    for (const jobId of jobIds) this.queueCaseIndex(jobId);
+  }
+
+  async retrieveCases(input: {
+    sessionID: string;
+    query: string;
+    topK?: number;
+    includeImages?: boolean;
+  }): Promise<Record<string, unknown>> {
+    const query = input.query?.trim();
+    if (!query) throw new AppError(400, "RETRIEVAL_QUERY_EMPTY", "retrieval query is required");
+    const job = this.store.read((state) => [...state.jobs].reverse().find((item) => item.openCodeSessionId === input.sessionID && !isTerminalJob(item.status)));
+    if (!job) throw new AppError(404, "ACTIVE_JOB_NOT_FOUND", "active job not found");
+    if (job.currentStage !== "requirements" && job.currentStage !== "codegen") {
+      throw new AppError(409, "RETRIEVAL_STAGE_INVALID", "retrieval is only available during requirements analysis or code generation");
+    }
+    const retrievalMode = job.retrievalMode ?? "full_and_subgraph";
+    if (retrievalMode === "none") return { ok: true, enabled: false, mode: "none", results: [] };
+    const requestedTopK = Number(input.topK ?? this.config.retrievalTopK ?? 5);
+    const topK = Number.isFinite(requestedTopK) ? Math.min(10, Math.max(1, Math.trunc(requestedTopK))) : 5;
+    const options: RetrievalQueryOptions = {
+      scope: retrievalMode,
+      sources: retrievalSources(job.retrievalPool ?? "both"),
+      topK,
+      subgraphMaxNodes: job.subgraphMaxNodes ?? DEFAULT_SUBGRAPH_MAX_NODES,
+      excludeCaseIds: [job.id],
+      requestId: randomUUID(),
+      jobId: job.id,
+      revision: this.jobRevision(job),
+    };
+    const activity: ToolActivity = {
+      id: options.requestId!, tool: "cadir_retrieve", status: "running",
+      query: this.compactText(query, 240), startedAt: now(),
+    };
+    const started = await this.store.transaction((state) => {
+      const current = state.jobs.find((item) => item.id === job.id);
+      if (!current || isTerminalJob(current.status)) return [];
+      const run = this.upsertToolActivity(state, current, activity);
+      const event = this.appendEvent(state, current, "retrieval.started", {
+        query, scope: options.scope, sources: options.sources, topK, subgraphMaxNodes: options.subgraphMaxNodes,
+        ...this.toolEventData(run, activity),
+      });
+      activity.orderSeq = event.seq;
+      this.upsertToolActivity(state, current, activity);
+      return [event];
+    });
+    this.store.publish(started);
+
+    const imageArtifacts = input.includeImages === false ? [] : this.store.read((state) => state.artifacts.filter((artifact) =>
+      artifact.jobId === job.id
+      && this.isCurrentRevision(job, artifact.revision)
+      && artifact.kind === "image"
+      && artifact.validated
+      && artifact.downloadUrl.startsWith("/api/uploads/"),
+    ));
+    const calls: Array<Promise<RetrievalResponse>> = [this.retrieval.retrieveText(query, options)];
+    for (const artifact of imageArtifacts) {
+      calls.push(readFile(artifact.path).then((bytes) => this.retrieval.retrieveImage({
+        bytes, filename: artifact.name, mimeType: artifact.mimeType,
+      }, options)));
+    }
+    const settled = await Promise.allSettled(calls);
+    const responses = settled.filter((item): item is PromiseFulfilledResult<RetrievalResponse> => item.status === "fulfilled").map((item) => item.value);
+    if (!responses.length) {
+      const detail = settled.filter((item): item is PromiseRejectedResult => item.status === "rejected").map((item) => this.safeError(item.reason)).join("; ");
+      const failed = await this.store.transaction((state) => {
+        const current = state.jobs.find((item) => item.id === job.id);
+        if (!current) return [];
+        const failedActivity: ToolActivity = {
+          ...activity, status: "failed", summary: this.compactText(detail), completedAt: now(),
+        };
+        const run = this.upsertToolActivity(state, current, failedActivity);
+        return [this.appendEvent(state, current, "retrieval.failed", {
+          code: "RETRIEVAL_UNAVAILABLE", message: "Case retrieval is unavailable; continue without retrieved Cases", detail,
+          ...this.toolEventData(run, failedActivity),
+        })];
+      });
+      this.store.publish(failed);
+      return { ok: false, enabled: true, mode: retrievalMode, error: { code: "RETRIEVAL_UNAVAILABLE", message: "Case retrieval is unavailable; continue without retrieved Cases", detail }, results: [] };
+    }
+
+    const results = this.mergeRetrievalResults(responses, topK);
+    const grantId = randomUUID();
+    const completed = await this.store.transaction((state) => {
+      const current = state.jobs.find((item) => item.id === job.id);
+      if (!current) return [];
+      state.retrievalGrants.push({
+        id: grantId, jobId: job.id, revision: this.jobRevision(job), query,
+        caseIds: results.map((item) => item.caseId), results: results.map((item) => ({ ...item })), createdAt: now(),
+      });
+      const summaries = results.map((item) => this.compactText(item.summary, 120)).filter((item): item is string => Boolean(item));
+      const completedActivity: ToolActivity = {
+        ...activity, status: "completed", resultCount: results.length,
+        summary: this.compactText(summaries.slice(0, 3).join("；")), completedAt: now(),
+      };
+      const run = this.upsertToolActivity(state, current, completedActivity);
+      return [this.appendEvent(state, current, "retrieval.completed", {
+        grantId, scope: options.scope, sources: options.sources, subgraphMaxNodes: options.subgraphMaxNodes,
+        returnedCount: results.length,
+        cases: results.map((item) => ({ caseId: item.caseId, rank: item.rank, matchKind: item.matchKind, summary: item.summary })),
+        partialFailures: settled.length - responses.length,
+        ...this.toolEventData(run, completedActivity),
+      })];
+    });
+    this.store.publish(completed);
+    return {
+      ok: true, enabled: true, mode: retrievalMode, pool: job.retrievalPool ?? "both", grantId, requestedTopK: topK,
+      returnedCount: results.length, partial: results.length < topK, results,
+    };
+  }
+
+  async readRetrievedCase(input: {
+    sessionID: string;
+    caseId: string;
+    subgraphId?: string;
+    include?: string[];
+  }): Promise<Record<string, unknown>> {
+    const job = this.store.read((state) => [...state.jobs].reverse().find((item) => item.openCodeSessionId === input.sessionID && !isTerminalJob(item.status)));
+    if (!job) throw new AppError(404, "ACTIVE_JOB_NOT_FOUND", "active job not found");
+    if ((job.retrievalMode ?? "full_and_subgraph") === "none") {
+      throw new AppError(409, "RETRIEVAL_DISABLED", "retrieval is disabled for this revision");
+    }
+    const grant = this.store.read((state) => [...state.retrievalGrants].reverse().find((item) =>
+      item.jobId === job.id && item.revision === this.jobRevision(job) && item.caseIds.includes(input.caseId),
+    ));
+    if (!grant) throw new AppError(403, "CASE_NOT_RETRIEVED", "the Case was not returned by retrieval for this revision");
+    if (input.subgraphId) {
+      const result = grant.results.find((item) => item.caseId === input.caseId);
+      const matches = Array.isArray(result?.subgraphMatches) ? result.subgraphMatches as Array<Record<string, unknown>> : [];
+      if (!matches.some((item) => item.subgraphId === input.subgraphId)) {
+        throw new AppError(403, "SUBGRAPH_NOT_RETRIEVED", "the subgraph was not returned by retrieval for this revision");
+      }
+    }
+    const allowed = new Set(["summary", "experience", "model.py", "model.json", "subgraph", "renders", "artifacts"]);
+    const include = (input.include?.length ? input.include : ["summary", "experience", "model.py", "model.json", "subgraph"])
+      .filter((item) => allowed.has(item));
+    const activity: ToolActivity = {
+      id: randomUUID(), tool: "cadir_case_read", status: "running", caseId: input.caseId,
+      startedAt: now(),
+    };
+    const started = await this.store.transaction((state) => {
+      const current = state.jobs.find((item) => item.id === job.id);
+      if (!current || isTerminalJob(current.status)) return [];
+      const run = this.upsertToolActivity(state, current, activity);
+      const event = this.appendEvent(state, current, "case.read.started", {
+        caseId: input.caseId, subgraphId: input.subgraphId, include,
+        ...this.toolEventData(run, activity),
+      });
+      activity.orderSeq = event.seq;
+      this.upsertToolActivity(state, current, activity);
+      return [event];
+    });
+    this.store.publish(started);
+    try {
+      const detail = await this.retrieval.readCase(input.caseId, { subgraphId: input.subgraphId, include });
+      const completed = await this.store.transaction((state) => {
+        const current = state.jobs.find((item) => item.id === job.id);
+        if (!current) return [];
+        const completedActivity: ToolActivity = {
+          ...activity, status: "completed", summary: this.retrievedCaseSummary(detail), completedAt: now(),
+        };
+        const run = this.upsertToolActivity(state, current, completedActivity);
+        return [this.appendEvent(state, current, "case.read.completed", {
+          caseId: input.caseId, subgraphId: input.subgraphId,
+          ...this.toolEventData(run, completedActivity),
+        })];
+      });
+      this.store.publish(completed);
+      return { ok: true, case: detail };
+    } catch (error) {
+      const message = this.safeError(error);
+      const failed = await this.store.transaction((state) => {
+        const current = state.jobs.find((item) => item.id === job.id);
+        if (!current) return [];
+        const failedActivity: ToolActivity = {
+          ...activity, status: "failed", summary: this.compactText(message), completedAt: now(),
+        };
+        const run = this.upsertToolActivity(state, current, failedActivity);
+        return [this.appendEvent(state, current, "case.read.failed", {
+          caseId: input.caseId, subgraphId: input.subgraphId,
+          error: { code: "CASE_READ_FAILED", message },
+          ...this.toolEventData(run, failedActivity),
+        })];
+      });
+      this.store.publish(failed);
+      return { ok: false, error: { code: "CASE_READ_FAILED", message } };
+    }
   }
 
   async deleteConversation(conversationId: string): Promise<DeleteConversationResult> {
@@ -199,20 +586,22 @@ export class CadirService {
     const conversationId = conversation.id;
 
     const jobId = randomUUID();
-    const selectedSettings = this.store.read((state) => state.modelSettings ?? { modelId: this.config.modelId, effort: "medium" as ModelEffort });
+    const selectedSettings = this.normalizeSettings(this.store.read((state) => state.modelSettings));
     const workspacePath = resolve(this.config.jobsRoot, jobId);
     await mkdir(workspacePath, { recursive: true });
     const uploads = await this.localizeUploads(workspacePath, this.resolveUploads(conversationId, request.imageArtifactIds ?? []));
-    const prompt = uploads.length
+    const userPrompt = uploads.length
       ? `${request.content.trim()}\n\nInput reference images (read these exact paths before modeling):\n${uploads.map((item) => `- ${item.localPath}`).join("\n")}`
       : request.content.trim();
+    const prompt = `${this.retrievalInstruction(selectedSettings)}\n\n${userPrompt}`;
     const timestamp = now();
     const initialEvents = await this.store.transaction((state) => {
       const liveConversation = state.conversations.find((item) => item.id === conversationId)!;
       const job: Job = {
         id: jobId, conversationId, status: "running", currentStage: "requirements", workspacePath,
         createdAt: timestamp, startedAt: timestamp, updatedAt: timestamp, backendHeartbeatAt: timestamp,
-        modelId: selectedSettings.modelId, modelProvider: this.config.modelProvider, effort: selectedSettings.effort, revision: 1,
+        modelId: selectedSettings.modelId, modelProvider: this.config.modelProvider, effort: selectedSettings.effort,
+        retrievalMode: selectedSettings.retrievalMode, retrievalPool: selectedSettings.retrievalPool, subgraphMaxNodes: selectedSettings.subgraphMaxNodes, revision: 1,
       };
       state.jobs.push(job);
       const stageRunId = randomUUID();
@@ -252,10 +641,10 @@ export class CadirService {
   private async startModification(conversation: Conversation, existingJob: Job, request: CreateMessageRequest): Promise<JobSnapshot> {
     const jobId = existingJob.id;
     const revision = this.jobRevision(existingJob) + 1;
-    const selectedSettings = this.store.read((state) => state.modelSettings ?? { modelId: this.config.modelId, effort: "medium" as ModelEffort });
+    const selectedSettings = this.normalizeSettings(this.store.read((state) => state.modelSettings));
     const usageBaseline = await this.readUsageBaseline(existingJob);
     const uploads = await this.localizeUploads(existingJob.workspacePath, this.resolveUploads(conversation.id, request.imageArtifactIds ?? []));
-    const prompt = this.modificationPrompt(request.content, existingJob.workspacePath, uploads);
+    const prompt = `${this.retrievalInstruction(selectedSettings)}\n\n${this.modificationPrompt(request.content, existingJob.workspacePath, uploads)}`;
     const timestamp = now();
     const events = await this.store.transaction((state) => {
       const job = state.jobs.find((item) => item.id === jobId && item.conversationId === conversation.id);
@@ -275,6 +664,9 @@ export class CadirService {
       job.modelId = selectedSettings.modelId;
       job.modelProvider = this.config.modelProvider;
       job.effort = selectedSettings.effort;
+      job.retrievalMode = selectedSettings.retrievalMode;
+      job.retrievalPool = selectedSettings.retrievalPool;
+      job.subgraphMaxNodes = selectedSettings.subgraphMaxNodes;
       state.stageRuns.push({ id: stageRunId, jobId, stage: "codegen", revision: nextRevision, attempt: 1, status: "running", usage: emptyUsage(), usageBaseline, startedAt: timestamp });
       const previousRequirements = [...state.artifacts].reverse().find((item) =>
         item.jobId === job.id && item.name.toLowerCase() === "requirements.md" && item.validated && !item.partial);
@@ -368,14 +760,16 @@ export class CadirService {
     return this.store.read((state) => {
       const job = state.jobs.find((item) => item.id === jobId);
       if (!job) throw notFound("job");
+      const events = state.events.filter((event) => event.jobId === jobId);
       const stageRuns = state.stageRuns.filter((run) => run.jobId === jobId).map((run) => ({
         ...run,
+        toolActivities: run.toolActivities ? run.toolActivities.map((item) => ({ ...item })) : undefined,
         usage: withoutCacheTotal(run.usage),
         usageBaseline: run.usageBaseline ? withoutCacheTotal(run.usageBaseline) : undefined,
       }));
+      this.appendLegacyToolActivities(stageRuns, events);
       const messages = state.messages.filter((message) => message.jobId === jobId);
       const artifacts = state.artifacts.filter((artifact) => artifact.jobId === jobId);
-      const events = state.events.filter((event) => event.jobId === jobId);
       return { serverTime: now(), lastSeq: events.at(-1)?.seq ?? 0, job, stageRuns, messages, usage: sumUsage(stageRuns.map((run) => run.usage)), artifacts };
     });
   }
@@ -492,6 +886,7 @@ export class CadirService {
     this.store.publish(events);
     const jobId = events[0]?.jobId ?? this.store.read((state) => [...state.jobs].reverse().find((item) => item.openCodeSessionId === request.sessionID)?.id);
     if (!jobId) throw new AppError(404, "ACTIVE_JOB_NOT_FOUND", "job not found");
+    if (events.some((event) => event.type === "job.completed")) this.queueCaseIndex(jobId);
     return this.getSnapshot(jobId);
   }
 
@@ -923,6 +1318,139 @@ export class CadirService {
     }
   }
 
+  private mergeRetrievalResults(responses: RetrievalResponse[], topK: number): RetrievalCaseResult[] {
+    const grouped = new Map<string, RetrievalCaseResult & { _rrf: number; _full: boolean; _subgraph: boolean }>();
+    for (const response of responses) {
+      response.results.forEach((result, index) => {
+        const rank = Math.max(1, Number(result.rank ?? index + 1));
+        const current = grouped.get(result.caseId) ?? {
+          ...result, caseId: result.caseId, _rrf: 0, _full: false, _subgraph: false, subgraphMatches: [],
+        };
+        current._rrf += 1 / (60 + rank);
+        current._full ||= result.matchKind === "full" || result.matchKind === "both" || Boolean(result.fullMatch);
+        current._subgraph ||= result.matchKind === "subgraph" || result.matchKind === "both" || Boolean(result.subgraphMatches?.length);
+        current.summary ||= result.summary;
+        current.experiencePreview ||= result.experiencePreview;
+        current.fullMatch ||= result.fullMatch;
+        current.availableFiles ||= result.availableFiles;
+        current.artifacts ||= result.artifacts;
+        const seen = new Set((current.subgraphMatches ?? []).map((item) => String(item.subgraphId ?? "")));
+        for (const match of result.subgraphMatches ?? []) {
+          const id = String(match.subgraphId ?? "");
+          if (!id || seen.has(id)) continue;
+          current.subgraphMatches!.push(match);
+          seen.add(id);
+        }
+        current.subgraphMatches = current.subgraphMatches!.sort((left, right) => Number(right.score ?? 0) - Number(left.score ?? 0)).slice(0, 3);
+        grouped.set(result.caseId, current);
+      });
+    }
+    return [...grouped.values()]
+      .sort((left, right) => right._rrf - left._rrf)
+      .slice(0, topK)
+      .map((item, index) => {
+        const { _rrf, _full, _subgraph, ...result } = item;
+        return {
+          ...result,
+          rank: index + 1,
+          fusedScore: _rrf,
+          matchKind: _full && _subgraph ? "both" : _subgraph ? "subgraph" : "full",
+        };
+      });
+  }
+
+  private queueCaseIndex(jobId: string): void {
+    if (!this.config.retrievalUrl) return;
+    const previous = this.indexingTasks.get(jobId) ?? Promise.resolve();
+    const task = previous.catch(() => undefined).then(async () => await this.runCaseIndex(jobId));
+    this.indexingTasks.set(jobId, task);
+    void task.finally(() => {
+      if (this.indexingTasks.get(jobId) === task) this.indexingTasks.delete(jobId);
+    });
+  }
+
+  private async runCaseIndex(jobId: string): Promise<void> {
+    const entry = this.store.read((state) => state.ragEntries.find((item) => item.sourceJobId === jobId));
+    if (!entry) return;
+    const revision = entry.revision ?? 1;
+    const modelFile = entry.files.find((item) => item.name.toLowerCase() === "model.json");
+    if (!modelFile) return await this.failCaseIndex(jobId, revision, "RAG Case has no model.json");
+    const requested = await this.store.transaction((state) => {
+      const currentEntry = state.ragEntries.find((item) => item.sourceJobId === jobId);
+      if (!currentEntry || (currentEntry.revision ?? 1) !== revision) return [];
+      currentEntry.indexStatus = "pending";
+      currentEntry.indexError = undefined;
+      const job = state.jobs.find((item) => item.id === jobId);
+      return job ? [this.appendEvent(state, job, "case.index.requested", { caseId: entry.id, revision, modelHash: modelFile.sha256 })] : [];
+    });
+    this.store.publish(requested);
+
+    try {
+      const modelJsonPath = resolve(entry.path, modelFile.relativePath);
+      const manifestPath = resolve(entry.path, "manifest.json");
+      this.assertChildPath(this.config.ragLibraryRoot, modelJsonPath);
+      this.assertChildPath(this.config.ragLibraryRoot, manifestPath);
+      let task = await this.retrieval.indexCase({
+        caseId: entry.id,
+        revision,
+        modelHash: modelFile.sha256,
+        modelJsonPath: relative(this.config.ragLibraryRoot, modelJsonPath).split(sep).join("/"),
+        manifestPath: relative(this.config.ragLibraryRoot, manifestPath).split(sep).join("/"),
+        files: entry.files.map((file) => {
+          const path = resolve(entry.path, file.relativePath);
+          this.assertChildPath(this.config.ragLibraryRoot, path);
+          return { name: file.name, path, mimeType: file.mimeType };
+        }),
+        replace: true,
+      });
+      await this.store.transaction((state) => {
+        const current = state.ragEntries.find((item) => item.sourceJobId === jobId && (item.revision ?? 1) === revision);
+        if (current) { current.indexStatus = "indexing"; current.indexTaskId = task.taskId; }
+      });
+      const deadline = Date.now() + 15 * 60_000;
+      while (!this.indexTaskCompleted(task.status)) {
+        if (this.indexTaskFailed(task.status)) throw new Error(String(task.error ?? `Retrieval indexing failed with status ${task.status}`));
+        if (Date.now() >= deadline) throw new Error("Retrieval indexing did not complete within 15 minutes");
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 1_000));
+        task = await this.retrieval.indexTask(task.taskId);
+      }
+      const completed = await this.store.transaction((state) => {
+        const current = state.ragEntries.find((item) => item.sourceJobId === jobId);
+        if (!current || (current.revision ?? 1) !== revision) return [];
+        current.indexStatus = "ready";
+        current.indexError = undefined;
+        current.indexTaskId = task.taskId;
+        current.indexedRevision = revision;
+        current.indexedAt = now();
+        const job = state.jobs.find((item) => item.id === jobId);
+        return job ? [this.appendEvent(state, job, "case.index.completed", { caseId: entry.id, revision, taskId: task.taskId })] : [];
+      });
+      this.store.publish(completed);
+    } catch (error) {
+      await this.failCaseIndex(jobId, revision, this.safeError(error));
+    }
+  }
+
+  private indexTaskCompleted(status: string): boolean {
+    return ["ready", "completed", "complete", "succeeded", "success"].includes(status.toLowerCase());
+  }
+
+  private indexTaskFailed(status: string): boolean {
+    return ["failed", "error", "cancelled", "canceled"].includes(status.toLowerCase());
+  }
+
+  private async failCaseIndex(jobId: string, revision: number, message: string): Promise<void> {
+    const failed = await this.store.transaction((state) => {
+      const entry = state.ragEntries.find((item) => item.sourceJobId === jobId);
+      if (!entry || (entry.revision ?? 1) !== revision) return [];
+      entry.indexStatus = "failed";
+      entry.indexError = message;
+      const job = state.jobs.find((item) => item.id === jobId);
+      return job ? [this.appendEvent(state, job, "case.index.failed", { caseId: entry.id, revision, error: { code: "CASE_INDEX_FAILED", message } })] : [];
+    });
+    this.store.publish(failed);
+  }
+
   private async performConversationDeletion(conversationId: string): Promise<DeleteConversationResult> {
     const plan = await this.store.transaction((state) => {
       const conversation = state.conversations.find((item) => item.id === conversationId);
@@ -974,6 +1502,7 @@ export class CadirService {
         state.artifacts = state.artifacts.filter((item) => !jobIds.has(item.jobId));
         state.uploads = state.uploads.filter((item) => item.conversationId !== conversationId);
         state.events = state.events.filter((item) => !jobIds.has(item.jobId));
+        state.retrievalGrants = state.retrievalGrants.filter((item) => !jobIds.has(item.jobId));
       });
       return { deleted: true, conversationId, retainedRagEntries: plan.retainedRagEntries };
     } catch (error) {
@@ -1068,6 +1597,8 @@ export class CadirService {
       const entry: RagArchiveEntry = {
         id: job.id, sourceConversationId: job.conversationId, sourceJobId: job.id,
         sourceTitle: conversation.title, path: finalPath, summary: manifest.summary, files: archiveFiles, createdAt, revision, updatedAt,
+        indexStatus: "pending", indexTaskId: undefined, indexError: undefined,
+        indexedRevision: existing?.indexedRevision, indexedAt: existing?.indexedAt,
       };
       const existingIndex = state.ragEntries.findIndex((item) => item.sourceJobId === job.id);
       if (existingIndex >= 0) state.ragEntries[existingIndex] = entry;

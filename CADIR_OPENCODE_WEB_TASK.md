@@ -1,6 +1,6 @@
 # CADIR OpenCode Web Agent - 任务与实施规格（讨论稿）
 
-> 文档状态：v0.1，供需求调整，不代表最终技术冻结。
+> 文档状态：v0.2，已加入独立的构造图 Case 检索服务设计。
 >
 > 依据：工作区论文 `CADIR_AAAI2026 (7).pdf`、`SimpleCADAPI-master.zip`，以及 OpenCode 当前官方 Server、SDK、Agent、Custom Tools 文档。
 
@@ -35,19 +35,20 @@
 10. 产物清单、文件下载、图片预览。
 11. Docker Compose 一键启动前端、API 网关和 OpenCode/CAD 执行环境。
 12. 全流程只使用一个 primary agent，不创建或调用任何 subagent。
+13. 支持文本/图片到相似 CAD Case 的完整图检索，以及完整图与三维特征子图联合检索。
 
 ### 2.2 明确不做
 
-- 暂不实现论文中的 Case Library / Retrieval Module。
-- 不做文本向量、图片向量、完整 construction graph 或局部 subgraph 检索。
-- 不引入向量数据库。
+- 不在 CADIR API 或浏览器内加载 embedding 模型；embedding、索引和召回统一由独立 Retrieval API 管理。
+- 不把原始 embedding 暴露给浏览器或 OpenCode agent。
+- 暂不引入外部向量数据库；基础索引和动态索引由 Retrieval API 以版本化文件管理。
 - 暂不支持 SolidWorks 和 Fusion 360 转换。
 - 暂不做多人协作、组织权限、计费和云对象存储。
 - “自进化”不表示在线训练模型，也不自动修改生产 agent 的系统提示词。
 
 ### 2.3 自进化在本期的定义
 
-本期自进化只负责对当前任务轨迹做复盘并输出结构化经验，包括：成功做法、失败操作、修复过程、最终验证结果和可复用建议。复盘写入当前任务目录，但不自动参与后续检索。
+自进化负责对当前任务轨迹做复盘并输出结构化经验，包括：成功做法、失败操作、修复过程、最终验证结果和可复用建议。成功归档的最新 revision 会异步提交给 Retrieval API 建立完整图和三维特征子图索引。
 
 建议输出：
 
@@ -56,7 +57,7 @@ jobs/<job_id>/artifacts/experience.json
 jobs/<job_id>/artifacts/experience.md
 ```
 
-后续若引入检索模块，可将已人工确认的经验和 construction graph 导入案例库。
+检索仅使用视觉验收成功并完成自进化归档的 Case；索引失败不改变已经完成的 CAD Job 状态。
 
 ## 3. 论文能力到单 Agent 系统的映射
 
@@ -70,7 +71,7 @@ jobs/<job_id>/artifacts/experience.md
 | Visual Feedback | `cadir-agent` 第 3 阶段 | 视觉反馈 | 多视图图片、检查结论、修改建议 |
 | Self-evolution | `cadir-agent` 第 4 阶段 | 自进化 | `experience.json`、`experience.md` |
 
-本期不映射论文中的 Retrieval Module。代码生成不依赖案例检索结果，也不调用其他 OpenCode agent。
+Retrieval Module 由独立常驻服务实现，并作为同一个 `cadir-agent` 的受控工具能力；它不是 OpenCode 子智能体。
 
 ## 4. 总体架构
 
@@ -80,6 +81,8 @@ flowchart LR
     A -->|"OpenCode HTTP API + SSE"| O["OpenCode Server"]
     O --> M["单个 cadir-agent\n连续四阶段状态机"]
     M --> T["受控 CAD 工具"]
+    M --> R["受控 Case 检索工具"]
+    R --> Q["独立 Retrieval API\n文本/图片 + 完整图/子图索引"]
     T --> P["Python + SimpleCADAPI / OCP"]
     P --> F["FreeCADCmd"]
     A --> D[("任务元数据")]
@@ -150,6 +153,8 @@ BFF 不实现模型推理，只负责身份校验、任务管理、OpenCode Serv
     cadir-run.ts
     cadir-publish.ts
     cadir-image.ts
+    cadir-retrieve.ts
+    cadir-case-read.ts
 opencode.json
 AGENTS.md
 ```
@@ -171,7 +176,7 @@ AGENTS.md
 - 不允许访问宿主机其他路径。
 - 禁止 Task 工具和全部 subagent 调用。
 - Bash 默认拒绝；只开放经过包装的 CAD 执行工具。
-- 禁止网络搜索和任意外部下载，除非未来明确增加。
+- 禁止网络搜索和任意外部下载；Case 检索只能经 BFF 的内部接口访问 Retrieval API。
 - FreeCAD 转换必须经 `cadir-run` 工具，不允许模型拼接任意 shell 命令。
 - 所有输入路径先 `resolve`，并校验仍位于当前 job 根目录内。
 
@@ -1369,7 +1374,7 @@ JOB_CANCELLED
 当且仅当以下条件全部满足，第一版才算完成：
 
 - 用户可从浏览器提交文本和图片；
-- 单个 OpenCode agent 在同一 session 中持续驱动 CADIR 四阶段工作流，不调用 subagent，且不包含检索模块；
+- 单个 OpenCode agent 在同一 session 中持续驱动 CADIR 四阶段工作流，不调用 subagent；Case 检索是该 agent 的受控工具能力；
 - 文本、状态和 Token 实时更新；
 - 被读取和生成的图片均有明确展示；
 - 代码执行和视觉反馈至少形成一次闭环；
@@ -1386,7 +1391,7 @@ JOB_CANCELLED
 - 阶段时间线只渲染后端已经创建的 StageRun，不提前创建“等待执行”的未来阶段。阶段完成后自动折叠，但过程行不会被摘要替换；重新展开时先显示完整过程，再显示独立的“阶段结果”。
 - 相邻的代码生成 retry 在前端合并为一个逻辑区块，错误信息保留在同一区块中；视觉反馈会切断分组，视觉失败后由后端创建的新 codegen 显示为新的“代码生成”。视觉成功才进入最终自进化。
 - BFF 为 Fastify 服务，负责 Conversation、Job、StageRun、Message、Artifact、Usage 和可重放事件；浏览器不直接连接 OpenCode。
-- OpenCode 只配置一个 `cadir-agent`。该 agent 在同一个 session 内连续执行需求分析、代码生成、视觉反馈和自进化，不启用 subagent，也不包含检索模块。
+- OpenCode 只配置一个 `cadir-agent`。该 agent 在同一个 session 内连续执行需求分析、代码生成、视觉反馈和自进化，不启用 subagent；检索只通过 `cadir_retrieve` 与 `cadir_case_read` 两个工具访问独立服务。
 - CAD 执行统一调用 SimpleCADAPI skill 和 `cad-runtime/cadir_runner.py`；四视图统一由 skill 提供的渲染能力生成。
 - OpenCode、SimpleCADAPI、FreeCADCmd 和 CAD runner 位于 `opencode` 容器；API 与 OpenCode 共享只用于任务文件的 named volume。
 - OpenCode assistant message 的 input、output、reasoning、cache read、cache write 和 total token 由 BFF 按会话历史幂等对账。即使任务已完成或 API 重启，零用量的完成态任务也会从 OpenCode session 补齐真实 token，不按文本长度估算。
@@ -1447,9 +1452,9 @@ FreeCADCmd 复核结果：FCStd 中的形体有效；STEP 为一个有效 Solid�
 
 Session 列表每 15 秒与服务端重新对账。其他页面删除当前 Session 后，本页自动切换到剩余 Session；没有剩余项时进入空白状态。
 
-### 23.2 只归档，不检索
+### 23.2 归档与异步索引
 
-当前版本不实现向量化、embedding、索引、召回或把历史经验注入 Agent。只有最新视觉反馈通过并进入最终自进化阶段后，Agent 才生成 `summary.md` 和 `experience.md`。前者保存需求、最终几何尺寸、几何验证和视觉结果；后者保存可复用的 SimpleCADAPI 建模方法、错误与修复、验证策略和限制，不保存隐藏推理过程。
+只有最新视觉反馈通过并进入最终自进化阶段后，Agent 才生成 `summary.md` 和 `experience.md`。前者保存需求、全部已完成修改、最终几何尺寸、几何验证和视觉结果；后者保存可复用的 SimpleCADAPI 建模方法、错误与修复、验证策略和限制，不保存隐藏推理过程。归档成功并完成 Job 后，BFF 异步通知 Retrieval API 为最新 revision 建立索引。
 
 后端在 Job 完成前，把以下内容复制到独立 Docker Volume：
 
@@ -1466,7 +1471,7 @@ Session 列表每 15 秒与服务端重新对账。其他页面删除当前 Sess
   manifest.json
 ```
 
-归档先写 `.tmp-<jobId>-<uuid>`，计算每个文件的 SHA-256 和大小，写入归档 `manifest.json`，最后在同一卷内原子重命名。归档失败时 evolution 不得完成。成功归档的条目记录在持久化状态的 `ragEntries` 中，并使用独立 `cadir-rag-library` Volume；删除来源 Session 时只删除 Session 数据，不删除该条目。
+归档先写 `.tmp-<jobId>-<uuid>`，计算每个文件的 SHA-256 和大小，写入归档 `manifest.json`，最后在同一卷内原子重命名。归档失败时 evolution 不得完成。成功归档的条目记录在持久化状态的 `ragEntries` 中，并使用独立 `cadir-rag-library` Volume；删除来源 Session 时只删除 Session 数据，不删除该条目。同一个 Job/Case 的后续修改使用递增 revision 原子替换归档；Retrieval API 采用幂等 upsert，只有新 revision 的文本空间和图片空间索引都就绪后才替换旧索引。
 
 ## 24. User 模型设置
 
@@ -1483,7 +1488,7 @@ gpt-5.6-terra
 
 OpenCode 的 prompt API 使用 `variant` 字段表达 effort；每个模型配置 `low`、`medium`、`high` 三个 variant，并映射到 `reasoningEffort`。前端只显示服务端实际返回并支持图片的模型，不根据名称猜测可用性。
 
-模型设置保存在 `DatabaseState.modelSettings`，默认值为 `gpt-5.6-sol / medium`。创建 Job 时将 `modelId`、`modelProvider` 和 `effort` 快照到 Job，并在整个 Job 生命周期内复用；设置修改只影响后续 Job，不影响正在运行的任务。服务端对模型和 effort 做白名单及 provider 能力校验，非法或当前不可用的组合返回结构化错误。
+模型设置保存在 `DatabaseState.modelSettings`，默认值为 `gpt-5.6-sol / medium`。同一面板还保存检索方式、检索库和子图最大节点数：`none` 为无检索，`full` 为仅完整图，`full_and_subgraph` 为完整图加子图；`base` 为基础库，`dynamic` 为动态 Case 库，`both` 为两库联合检索；节点数范围 3-64，默认 16，仅在联合模式显示。创建 Job/revision 时将模型、effort 和检索设置快照到 Job，并在本轮生命周期内复用；设置修改只影响下一次请求，不影响正在运行的任务。服务端对所有字段做白名单和范围校验。关闭动态库检索不会停止自进化 Case 的归档和索引。
 
 ## 25. 前端精确错误展示
 
@@ -1510,3 +1515,44 @@ OpenCode 的 prompt API 使用 `variant` 字段表达 effort；每个模型配�
 `cadir_run` 保留为单 Agent 在代码生成阶段使用的受控执行与调试工具。其失败只写入当前 StageRun 的 `toolError` 和 `tool.updated` 事件，Job 保持 `running`，前端在当前阶段内显示“调试报错”。Agent 调用 `cadir_stage(action="retry")` 时，当前 attempt 使用该工具错误作为失败详情并创建新的运行 attempt；历史工具错误不得终止新的 attempt。
 
 运行中的 Job 只允许模型服务或 OpenCode 会话级错误直接触发 `job.failed`。supervisor 扫描 OpenCode 消息历史时不得把 `part.error` 或 `part.state.error` 升级为当前 Job 的终态错误；工具错误仅可用于已经失败任务的技术详情回填。`cadir_run` 后续成功或阶段成功完成时清除当前 StageRun 的临时 `toolError`。
+
+## 29. 独立 CAD Case Retrieval API
+
+Retrieval API 是独立 Docker 服务，一个常驻实例可供多个 CADIR session 共享。它负责加载文本和图片查询模型、维护完整构造图与三维特征子图的两套 CAD embedding、合并基础索引与动态 Case 索引；CADIR BFF 只保存用户选择、发起检索、签发可读 Case 范围和提交异步索引任务。
+
+### 29.1 检索范围与子图
+
+- `full`：只检索完整 construction graph。
+- `subgraph`：只检索三维特征子图，保留为 Retrieval API 的评估/内部能力，不直接出现在 CADIR 前端。
+- `full_and_subgraph`：分别召回完整图和子图，以 RRF 合并并按 `caseId` 去重，再返回唯一 Case Top-K。
+- 子图根节点只选择产生 Solid/Shape 的三维特征、布尔、Compound/Assembly，以及消费已有三维结果的合法变换节点。
+- 子图必须包含根节点的完整递归输入闭包，超过用户最大节点数时整张子图舍弃，禁止截断依赖；完整图和重复闭包不再作为子图保存。
+- 每个 Case 最多建立 8 个不同规模的子图索引；一次检索对同一 Case 最多返回 3 个最佳子图匹配。
+
+### 29.2 OpenCode 工具
+
+`cadir_retrieve` 接受当前需求、Top-K 和是否合并本轮上传图片。BFF 使用 Job 快照强制实际 scope、检索来源 `sources`、节点限制、当前 revision 和排除当前 Case，分别调用文本/图片检索后再按 Case 去重。`sources=["base"]`、`["dynamic"]` 或 `["base","dynamic"]` 分别对应基础库、动态库或联合检索。工具返回 Case 摘要、匹配类型和受控的 `subgraphId`，不返回 embedding 或任意文件路径。
+
+`cadir_case_read` 只能读取当前 revision 最近检索结果中已经授权的 `caseId`，传入 `subgraphId` 时还必须属于该 Case 的已返回子图。默认只提供摘要、经验、`model.py`、`model.json` 和命中的子图；任意 Case ID、任意子图和任意宿主机路径都被拒绝。Agent 在写代码或修复前最多调用一次检索，并只阅读一到两个最相关 Case。检索或 Case 读取失败只产生 `retrieval.failed`，建模流程继续。
+
+### 29.3 Case 发布和索引一致性
+
+`cadir_publish` 仍是成功 Job 的唯一发布边界。BFF 在完成归档后异步调用 `POST /v1/index/cases`，保存 `indexTaskId` 并轮询任务；索引状态为 `pending/indexing/ready/failed`，通过 SSE 发布 `case.index.*` 事件。索引失败只写入 Case 状态，不能回滚或改写已经完成的 Job。API 重启时重新提交尚未 ready 的最新 revision。
+
+Retrieval API 只读挂载 `cadir_cadir-rag-library`，动态索引写入自己的持久卷。相同 `caseId + revision + modelHash` 重复提交复用已有任务；新 revision 的文本和图片 CAD embedding 全部写入成功后再切换活动版本，构建期间旧 revision 继续可检索。
+
+基础索引是可替换的冷启动/评估池，不是最终 RAG 数据源。生产切换为只使用 CADIR 自进化 Case 时设置 `CADIR_ENABLE_BASE_INDEX=0`，查询和 Case 读取都完全忽略基础索引，只加载动态 RAG 索引；前端三种检索方式与 OpenCode 工具契约保持不变。
+
+### 29.4 内部 HTTP 契约
+
+```text
+GET  /health
+GET  /ready
+POST /v1/retrieve/text
+POST /v1/retrieve/image
+POST /v1/index/cases
+GET  /v1/index/tasks/{taskId}
+GET  /v1/cases/{caseId}
+```
+
+所有 `/v1` 请求使用与 CADIR 内部调用一致的 `x-internal-token`。浏览器不直连 Retrieval API，Retrieval API 不调用 OpenCode。CADIR Compose 先创建 `cadir-internal` 网络和 Case 卷，检索 Compose 再作为独立项目加入该网络；20 个浏览器窗口仍复用同一个检索服务和索引，而不是启动 20 份 embedding 模型。

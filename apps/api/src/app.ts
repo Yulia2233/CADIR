@@ -5,6 +5,7 @@ import type { CreateMessageRequest, ModelSettings, Stage, StageTransitionRequest
 import type { AppConfig } from "./config.js";
 import { AppError } from "./errors.js";
 import type { OpenCodeAdapter } from "./opencode.js";
+import type { RetrievalAdapter } from "./retrieval.js";
 import { CadirService } from "./service.js";
 import { JsonStore } from "./store.js";
 
@@ -13,7 +14,7 @@ const integer = (value: unknown, fallback = 0): number => {
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback;
 };
 
-export interface BuildAppOptions { config: AppConfig; adapter: OpenCodeAdapter; store?: JsonStore }
+export interface BuildAppOptions { config: AppConfig; adapter: OpenCodeAdapter; retrieval?: RetrievalAdapter; store?: JsonStore }
 
 export async function buildApp(options: BuildAppOptions): Promise<FastifyInstance> {
   const app = Fastify({ logger: { redact: ["req.headers.authorization", "req.headers.x-internal-token"] } });
@@ -21,7 +22,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   await app.register(multipart, { limits: { files: 1, fileSize: 10 * 1024 * 1024, fields: 0 } });
   const store = options.store ?? new JsonStore(options.config.dataFile);
   await store.init();
-  const service = new CadirService(store, options.adapter, options.config);
+  const service = new CadirService(store, options.adapter, options.config, options.retrieval);
   app.decorate("cadirService", service);
 
   app.setErrorHandler((error, _request, reply) => {
@@ -32,7 +33,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     void reply.status(appError.statusCode).send({ error: { code: appError.code, message: appError.message } });
   });
 
-  app.get("/api/health", async () => ({ healthy: true, openCodeHealthy: await options.adapter.health(), serverTime: new Date().toISOString() }));
+  app.get("/api/health", async () => ({ healthy: true, openCodeHealthy: await options.adapter.health(), retrievalHealthy: await service.retrievalHealthy(), serverTime: new Date().toISOString() }));
   app.post<{ Body: { title?: string } }>("/api/conversations", async (request, reply) => reply.code(201).send(await service.createConversation(request.body?.title)));
   app.get("/api/conversations", async () => ({ conversations: service.listConversations() }));
   app.get("/api/settings", async () => await service.getModelSettings());
@@ -132,6 +133,15 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     requireInternal(request.headers);
     return reply.code(201).send(await service.registerArtifact(request.body));
   });
+  app.post<{ Body: { sessionID: string; query: string; topK?: number; includeImages?: boolean } }>("/internal/retrieve", async (request) => {
+    requireInternal(request.headers);
+    return await service.retrieveCases(request.body);
+  });
+  app.post<{ Body: { sessionID: string; caseId: string; subgraphId?: string; include?: string[] } }>("/internal/retrieved-case", async (request) => {
+    requireInternal(request.headers);
+    return await service.readRetrievedCase(request.body);
+  });
+  service.resumePendingIndexing();
   return app;
 }
 

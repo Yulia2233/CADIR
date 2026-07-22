@@ -6,6 +6,9 @@ import test from "node:test";
 import type { ModelOption } from "../../../packages/contracts/src/index.js";
 import type { AppConfig } from "../src/config.js";
 import type { OpenCodeAdapter, OpenCodeEvent, OpenCodeSession, PromptModel } from "../src/opencode.js";
+import type {
+  CaseIndexRequest, IndexTaskResponse, RetrievalAdapter, RetrievalQueryOptions, RetrievalResponse,
+} from "../src/retrieval.js";
 import { CadirService } from "../src/service.js";
 import { JsonStore } from "../src/store.js";
 import { OpenCodeEventSupervisor } from "../src/supervisor.js";
@@ -52,7 +55,43 @@ class FakeAdapter implements OpenCodeAdapter {
   async *events(): AsyncIterable<OpenCodeEvent> { await new Promise(() => undefined); }
 }
 
-async function fixture() {
+class FakeRetrievalAdapter implements RetrievalAdapter {
+  textCalls: Array<{ query: string; options: RetrievalQueryOptions }> = [];
+  imageCalls: Array<{ filename: string; options: RetrievalQueryOptions }> = [];
+  indexCalls: CaseIndexRequest[] = [];
+  failQueries = false;
+  async health(): Promise<boolean> { return true; }
+  async retrieveText(query: string, options: RetrievalQueryOptions): Promise<RetrievalResponse> {
+    this.textCalls.push({ query, options });
+    if (this.failQueries) throw new Error("retrieval offline");
+    return {
+      results: [
+        { caseId: "case-a", rank: 1, matchKind: "full", summary: "Full plate" },
+        { caseId: "case-b", rank: 2, matchKind: "subgraph", summary: "Bracket feature", subgraphMatches: [{ subgraphId: "sub-b", nodeCount: 12, score: 0.8 }] },
+      ],
+    };
+  }
+  async retrieveImage(image: { bytes: Uint8Array; filename: string }, options: RetrievalQueryOptions): Promise<RetrievalResponse> {
+    this.imageCalls.push({ filename: image.filename, options });
+    if (this.failQueries) throw new Error("image retrieval offline");
+    return {
+      results: [
+        { caseId: "case-a", rank: 1, matchKind: "subgraph", summary: "Full plate", subgraphMatches: [{ subgraphId: "sub-a", nodeCount: 8, score: 0.9 }] },
+        { caseId: "case-c", rank: 2, matchKind: "full", summary: "Image-similar case" },
+      ],
+    };
+  }
+  async indexCase(input: CaseIndexRequest): Promise<IndexTaskResponse> {
+    this.indexCalls.push(input);
+    return { taskId: `task-${input.revision}`, status: "ready" };
+  }
+  async indexTask(taskId: string): Promise<IndexTaskResponse> { return { taskId, status: "ready" }; }
+  async readCase(caseId: string, options?: { subgraphId?: string; include?: string[] }): Promise<Record<string, unknown>> {
+    return { caseId, summary: "A reinforced plate with a reusable bracket feature", ...options };
+  }
+}
+
+async function fixture(options: { retrievalUrl?: string } = {}) {
   const root = await mkdtemp(join(tmpdir(), "cadir-api-"));
   const jobsRoot = join(root, "jobs");
   await mkdir(jobsRoot);
@@ -60,12 +99,14 @@ async function fixture() {
     host: "127.0.0.1", port: 0, dataFile: join(root, "db.json"), jobsRoot, ragLibraryRoot: join(root, "rag-library"),
     corsOrigin: "*", heartbeatMs: 50, watchdogMs: 1_000, openCodeUrl: "http://fake",
     openCodeUsername: "opencode", openCodeAgent: "cadir-agent", modelProvider: "cadir", modelId: "gpt-5.6-sol",
+    retrievalUrl: options.retrievalUrl,
   };
   const store = new JsonStore(config.dataFile);
   await store.init();
   const adapter = new FakeAdapter();
-  const service = new CadirService(store, adapter, config);
-  return { root, jobsRoot, config, store, adapter, service };
+  const retrieval = new FakeRetrievalAdapter();
+  const service = new CadirService(store, adapter, config, retrieval);
+  return { root, jobsRoot, config, store, adapter, retrieval, service };
 }
 
 test("creates an authoritative running snapshot and replayable monotonic events", async () => {
@@ -86,13 +127,115 @@ test("model settings use available image-capable models and snapshot onto new jo
   const available = await service.getModelSettings();
   assert.deepEqual(available.models.map((item) => item.id), ["gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"]);
   const updated = await service.updateModelSettings({ modelId: "gpt-5.5", effort: "high" });
-  assert.deepEqual(updated.settings, { modelId: "gpt-5.5", effort: "high" });
+  assert.deepEqual(updated.settings, { modelId: "gpt-5.5", effort: "high", retrievalMode: "full_and_subgraph", retrievalPool: "both", subgraphMaxNodes: 16 });
   const conversation = await service.createConversation();
   const snapshot = await service.submitMessage(conversation.id, { content: "Use the selected model" });
   assert.deepEqual({ modelId: snapshot.job.modelId, modelProvider: snapshot.job.modelProvider, effort: snapshot.job.effort }, { modelId: "gpt-5.5", modelProvider: "cadir", effort: "high" });
+  assert.deepEqual({ retrievalMode: snapshot.job.retrievalMode, retrievalPool: snapshot.job.retrievalPool, subgraphMaxNodes: snapshot.job.subgraphMaxNodes }, { retrievalMode: "full_and_subgraph", retrievalPool: "both", subgraphMaxNodes: 16 });
   assert.deepEqual(adapter.prompts.at(-1)?.model, { modelId: "gpt-5.5", providerId: "cadir", effort: "high" });
   await assert.rejects(service.updateModelSettings({ modelId: "gpt-5.6", effort: "medium" }), (error: any) => error.code === "MODEL_NOT_ALLOWED");
   await assert.rejects(service.updateModelSettings({ modelId: "gpt-5.5", effort: "xhigh" as any }), (error: any) => error.code === "EFFORT_INVALID");
+});
+
+test("retrieval settings drive pool-scoped multimodal unique Case results and scoped Case reads", async () => {
+  const { service, retrieval, adapter, config } = await fixture();
+  await service.updateModelSettings({ retrievalMode: "full_and_subgraph", retrievalPool: "dynamic", subgraphMaxNodes: 24 });
+  const conversation = await service.createConversation();
+  const upload = await service.createUpload(conversation.id, {
+    filename: "reference.png", mimeType: "image/png", data: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  });
+  const snapshot = await service.submitMessage(conversation.id, {
+    content: "Create a plate with a reinforced bracket", imageArtifactIds: [upload.id],
+  });
+  const response = await service.retrieveCases({
+    sessionID: snapshot.job.openCodeSessionId!, query: "reinforced plate bracket", includeImages: true, topK: 5,
+  });
+  const results = response.results as Array<Record<string, any>>;
+  assert.equal(response.returnedCount, 3);
+  assert.deepEqual(new Set(results.map((item) => item.caseId)), new Set(["case-a", "case-b", "case-c"]));
+  assert.equal(results.find((item) => item.caseId === "case-a")?.matchKind, "both");
+  assert.equal(retrieval.textCalls[0].options.scope, "full_and_subgraph");
+  assert.deepEqual(retrieval.textCalls[0].options.sources, ["dynamic"]);
+  assert.equal(retrieval.textCalls[0].options.subgraphMaxNodes, 24);
+  assert.equal(retrieval.imageCalls.length, 1);
+  assert.deepEqual(retrieval.imageCalls[0].options.sources, ["dynamic"]);
+  const detail = await service.readRetrievedCase({ sessionID: snapshot.job.openCodeSessionId!, caseId: "case-a", subgraphId: "sub-a" });
+  assert.equal((detail.case as any).caseId, "case-a");
+  await assert.rejects(
+    service.readRetrievedCase({ sessionID: snapshot.job.openCodeSessionId!, caseId: "case-missing" }),
+    (error: any) => error.code === "CASE_NOT_RETRIEVED",
+  );
+  const events = service.eventsAfter(snapshot.job.id, 0).map((event) => event.type);
+  assert.equal(events.includes("retrieval.started"), true);
+  assert.equal(events.includes("retrieval.completed"), true);
+  assert.equal(events.includes("case.read.started"), true);
+  assert.equal(events.includes("case.read.completed"), true);
+  const activities = service.getSnapshot(snapshot.job.id).stageRuns[0].toolActivities ?? [];
+  assert.deepEqual(activities.map((item) => [item.tool, item.status]), [
+    ["cadir_retrieve", "completed"],
+    ["cadir_case_read", "completed"],
+  ]);
+  assert.equal(activities[0].resultCount, 3);
+  assert.match(activities[0].summary ?? "", /Full plate/);
+  assert.match(activities[1].summary ?? "", /reinforced plate/);
+  const reloaded = new JsonStore(config.dataFile);
+  await reloaded.init();
+  const reloadedService = new CadirService(reloaded, adapter, config, retrieval);
+  assert.deepEqual(
+    reloadedService.getSnapshot(snapshot.job.id).stageRuns[0].toolActivities?.map((item) => item.tool),
+    ["cadir_retrieve", "cadir_case_read"],
+  );
+});
+
+test("disabled or unavailable retrieval never fails the CAD job", async () => {
+  const disabledFixture = await fixture();
+  await disabledFixture.service.updateModelSettings({ retrievalMode: "none" });
+  const conversation = await disabledFixture.service.createConversation();
+  const snapshot = await disabledFixture.service.submitMessage(conversation.id, { content: "Create a washer" });
+  const disabled = await disabledFixture.service.retrieveCases({ sessionID: snapshot.job.openCodeSessionId!, query: "washer" });
+  assert.equal(disabled.enabled, false);
+  assert.equal(disabledFixture.retrieval.textCalls.length, 0);
+
+  const failedFixture = await fixture();
+  failedFixture.retrieval.failQueries = true;
+  const failedConversation = await failedFixture.service.createConversation();
+  const failedSnapshot = await failedFixture.service.submitMessage(failedConversation.id, { content: "Create a flange" });
+  const failed = await failedFixture.service.retrieveCases({ sessionID: failedSnapshot.job.openCodeSessionId!, query: "flange" });
+  assert.equal(failed.ok, false);
+  assert.equal(failedFixture.service.getSnapshot(failedSnapshot.job.id).job.status, "running");
+  assert.equal(failedFixture.service.eventsAfter(failedSnapshot.job.id, 0).at(-1)?.type, "retrieval.failed");
+  assert.equal(failedFixture.service.getSnapshot(failedSnapshot.job.id).stageRuns[0].toolActivities?.[0].status, "failed");
+});
+
+test("pending archived Cases are asynchronously indexed without blocking jobs", async () => {
+  const { service, retrieval, store, root } = await fixture({ retrievalUrl: "http://retrieval.test" });
+  const conversation = await service.createConversation();
+  const snapshot = await service.submitMessage(conversation.id, { content: "Create an indexed plate" });
+  const entryPath = join(root, "rag-library", "entries", snapshot.job.id);
+  await mkdir(entryPath, { recursive: true });
+  await writeFile(join(entryPath, "model.json"), JSON.stringify({ graph: { nodes: [{ node_id: "solid", op: "make_extrude_rsolid", inputs: [] }] } }));
+  await writeFile(join(entryPath, "manifest.json"), "{}");
+  await store.transaction((state) => {
+    state.ragEntries.push({
+      id: snapshot.job.id, sourceConversationId: conversation.id, sourceJobId: snapshot.job.id,
+      sourceTitle: conversation.title, path: entryPath, summary: "Indexed plate", revision: 1,
+      files: [{ name: "model.json", relativePath: "model.json", mimeType: "application/json", size: 1, sha256: "model-hash" }],
+      createdAt: new Date().toISOString(), indexStatus: "pending",
+    });
+  });
+  service.resumePendingIndexing();
+  const deadline = Date.now() + 1_000;
+  while (Date.now() < deadline && store.read((state) => state.ragEntries[0].indexStatus) !== "ready") {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const entry = store.read((state) => state.ragEntries[0]);
+  assert.equal(entry.indexStatus, "ready");
+  assert.equal(entry.indexedRevision, 1);
+  assert.equal(retrieval.indexCalls.length, 1);
+  assert.equal(retrieval.indexCalls[0].modelJsonPath, `entries/${snapshot.job.id}/model.json`);
+  assert.equal(retrieval.indexCalls[0].manifestPath, `entries/${snapshot.job.id}/manifest.json`);
+  assert.deepEqual(retrieval.indexCalls[0].files?.map((file) => file.name), ["model.json"]);
+  assert.equal(service.getSnapshot(snapshot.job.id).job.status, "running");
 });
 
 test("OpenCode part events resolve the job through part.sessionID", async () => {
@@ -450,11 +593,13 @@ test("final evolution transition is the authoritative completion boundary", asyn
 });
 
 test("deleting an active conversation aborts OpenCode and removes all session-owned files", async () => {
-  const { service, adapter, jobsRoot } = await fixture();
+  const { service, adapter, jobsRoot, store } = await fixture();
   const conversation = await service.createConversation("Disposable session");
   const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from("image")]);
   await service.createUpload(conversation.id, { filename: "reference.png", mimeType: "image/png", data: png });
   const snapshot = await service.submitMessage(conversation.id, { content: "Create a disposable part" });
+  await service.retrieveCases({ sessionID: snapshot.job.openCodeSessionId!, query: "disposable part" });
+  assert.equal(store.read((state) => state.retrievalGrants.some((item) => item.jobId === snapshot.job.id)), true);
   const result = await service.deleteConversation(conversation.id);
   assert.equal(result.deleted, true);
   assert.deepEqual(adapter.aborted, ["session-1", "delete:session-1"]);
@@ -462,6 +607,7 @@ test("deleting an active conversation aborts OpenCode and removes all session-ow
   await assert.rejects(access(join(jobsRoot, "uploads", conversation.id)));
   assert.throws(() => service.getConversation(conversation.id), (error: any) => error.code === "NOT_FOUND");
   assert.throws(() => service.getSnapshot(snapshot.job.id), (error: any) => error.code === "NOT_FOUND");
+  assert.equal(store.read((state) => state.retrievalGrants.some((item) => item.jobId === snapshot.job.id)), false);
   const repeated = await service.deleteConversation(conversation.id);
   assert.equal(repeated.alreadyDeleted, true);
 });

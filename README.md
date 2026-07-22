@@ -11,7 +11,8 @@ CADIR 生成的不是只能查看的网格截图，而是可继续编辑的跨�
 - Docker 中运行 API、网页和包含 FreeCAD 环境的 OpenCode CAD 运行时。
 - `cadir_run` 负责执行和验证 CADIR 模型；FreeCAD 用于将结果转换为可编辑的 `FCStd` 文件。
 - 后端持久化会话、阶段事件、错误、Token 用量和产物，浏览器断开后可重新连接并回放事件。
-- 成功任务的自进化产物单独保存到 `cadir-rag-library` 归档卷；当前版本只保存，不启用检索。
+- 成功任务的自进化产物单独保存到 `cadir-rag-library`；独立 Retrieval API 异步建立文本、图片、完整构造图和三维特征子图索引。
+- User 设置提供“无检索”“仅完整检索”“完整 + 子图检索”三种模式，子图最大节点数可配置。
 
 ## 系统结构
 
@@ -23,15 +24,17 @@ web (Nginx + React)
    │ /api
    ▼
 api (Fastify BFF)
-   │ OpenCode API + internal callbacks
-   ▼
-opencode (OpenCode + CADIR runtime + FreeCADCmd)
+   ├── OpenCode API + internal callbacks
+   │   ▼
+   │  opencode (OpenCode + CADIR runtime + FreeCADCmd)
+   │
+   └── Retrieval API (text/image -> similar CAD Cases)
    │
    ├── /workspace/jobs       任务、运行记录和最终产物
    └── /home/cadir/...       OpenCode 本地数据
 ```
 
-API 是会话和任务状态的唯一来源。浏览器不会接触 LLM API Key；OpenCode 的工具回调通过内部 Token 访问 API。
+API 是会话和任务状态的唯一来源。浏览器不会接触 LLM API Key、检索服务或原始 embedding；OpenCode 只能通过 `cadir_retrieve` 和 `cadir_case_read` 两个受控工具访问检索能力。
 
 ## 快速部署（Docker Compose）
 
@@ -62,15 +65,32 @@ CADIR_LLM_BASE_URL=https://openrouter.icu/v1
 CADIR_LLM_API_KEY=替换为服务端API密钥
 INTERNAL_API_TOKEN=生成一个随机的内部调用令牌
 OPENCODE_SERVER_PASSWORD=生成一个随机的OpenCode密码
+RETRIEVAL_URL=http://retrieval-api:8000
 ```
 
 `CADIR_LLM_BASE_URL` 必须提供 OpenAI-compatible `/v1` 接口。默认模型是 `gpt-5.6-sol`；网页中的模型设置会使用后端公布的可用模型列表进行校验。
 
-### 2. 构建并启动
+### 2. 构建并启动 CADIR
 
 ```bash
 docker compose up -d --build
 ```
+
+CADIR 会先创建共享网络 `cadir-internal` 和 Case 卷 `cadir_cadir-rag-library`。检索服务不可用时，CADIR 仍可完成建模，只会跳过案例检索和异步索引。
+
+### 3. 启动独立 Retrieval API
+
+检索服务位于 `E:\aaai27\retrieve\last-version\retrieval-api`。首次部署需先按照该目录的 README 准备两个 checkpoint、两个本地 backbone 和 schema 2.0 基础索引，然后启动：
+
+```powershell
+Set-Location E:\aaai27\retrieve\last-version\retrieval-api
+Copy-Item .env.example .env
+docker compose --env-file .env up -d --build
+```
+
+检索目录 `.env` 中的 `RETRIEVAL_INTERNAL_TOKEN` 必须填写为 CADIR 根目录 `.env` 的 `INTERNAL_API_TOKEN`。该服务加入 `cadir-internal`，并以只读方式挂载 CADIR 的 Case 卷。在线请求只返回 Case ID、分数和受控内容，不向浏览器或 agent 返回 embedding。单个常驻服务可供多个 CADIR session 并发复用，避免每个窗口重复加载大模型。
+
+当前 6,000-Case 基础索引只作为冷启动与检索模型验收库。后续以自进化 RAG Case 为正式检索池时，在检索服务 `.env` 设置 `CADIR_ENABLE_BASE_INDEX=0`；服务会完全忽略基础库，只检索动态 RAG 索引。
 
 查看服务状态：
 
@@ -84,12 +104,12 @@ docker compose ps
 docker compose logs -f api opencode web
 ```
 
-### 3. 打开网页
+### 4. 打开网页
 
 默认地址：
 
 - Web：<http://localhost:5173>
-- API 健康检查：<http://localhost:3001/health>
+- API 健康检查：<http://localhost:3001/api/health>
 
 自定义端口时，在 `.env` 中设置：
 
@@ -112,7 +132,7 @@ Compose 使用以下 named volumes 保存数据，重启容器不会丢失：
 | --- | --- |
 | `cadir-data` | 会话、任务状态、事件和 Token 用量数据库文件 |
 | `cadir-jobs` | 每个任务的 requirements、模型源文件、渲染图和导出模型 |
-| `cadir-rag-library` | 成功自进化归档：`model.py`、`model.json`、渲染图、摘要和经验；当前不做检索 |
+| `cadir-rag-library` | 成功自进化 Case：`model.py`、`model.json`、渲染图、摘要和经验；供 Retrieval API 只读索引 |
 | `opencode-data` | OpenCode 的本地运行数据 |
 
 成功任务的最终运行目录通常包含：
@@ -202,8 +222,9 @@ pnpm build
 2. API 创建 job，并记录 OpenCode usage 基线，避免重试阶段重复计算历史 Token。
 3. OpenCode 在同一个会话内依次完成需求分析、代码生成和 `cadir_run` CAD 运行。
 4. 视觉反馈阶段检查四个方向的渲染图；失败时回到代码生成修正，成功后才进入自进化。
-5. 自进化阶段将成功模型、渲染图、摘要和经验写入独立归档库。
-6. API 注册最终产物并通过 SSE 推送状态；网页断线重连后会先获取快照，再从最后一个事件序号继续接收。
+5. 检索开启时，agent 在写代码或修复前调用 `cadir_retrieve`，并只读取一到两个最相关 Case；检索失败不会让 Job 失败。
+6. 自进化阶段将成功模型、渲染图、摘要和经验写入独立归档库；Job 完成后 API 异步提交 Case 索引，旧 revision 在新索引就绪前继续可用。
+7. API 注册最终产物并通过 SSE 推送状态；网页断线重连后会先获取快照，再从最后一个事件序号继续接收。
 
 ## 许可证和参考资料
 

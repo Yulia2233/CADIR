@@ -15,6 +15,10 @@ export interface AppConfig {
   openCodeAgent: string;
   modelProvider: string;
   modelId: string;
+  retrievalUrl?: string;
+  retrievalInternalToken?: string;
+  retrievalTimeoutMs?: number;
+  retrievalTopK?: number;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -33,5 +37,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     openCodeAgent: env.OPENCODE_AGENT ?? "cadir-agent",
     modelProvider: env.OPENCODE_MODEL_PROVIDER ?? "cadir",
     modelId: env.CADIR_MODEL_ID ?? "gpt-5.6-sol",
+    retrievalUrl: env.RETRIEVAL_URL?.trim() || undefined,
+    retrievalInternalToken: env.RETRIEVAL_INTERNAL_TOKEN?.trim() || env.INTERNAL_API_TOKEN?.trim() || undefined,
+    retrievalTimeoutMs: Number(env.RETRIEVAL_TIMEOUT_MS ?? 30_000),
+    retrievalTopK: Number(env.RETRIEVAL_TOP_K ?? 5),
   };
 }

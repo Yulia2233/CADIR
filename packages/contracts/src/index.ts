@@ -4,6 +4,16 @@ export type Stage = (typeof STAGES)[number];
 export const MODEL_EFFORTS = ["low", "medium", "high"] as const;
 export type ModelEffort = (typeof MODEL_EFFORTS)[number];
 
+export const RETRIEVAL_MODES = ["none", "full", "full_and_subgraph"] as const;
+export type RetrievalMode = (typeof RETRIEVAL_MODES)[number];
+export const RETRIEVAL_POOLS = ["base", "dynamic", "both"] as const;
+export type RetrievalPool = (typeof RETRIEVAL_POOLS)[number];
+export const RETRIEVAL_SOURCES = ["base", "dynamic"] as const;
+export type RetrievalSource = (typeof RETRIEVAL_SOURCES)[number];
+export const DEFAULT_SUBGRAPH_MAX_NODES = 16;
+export const MIN_SUBGRAPH_MAX_NODES = 3;
+export const MAX_SUBGRAPH_MAX_NODES = 64;
+
 export interface ModelOption {
   id: string;
   label: string;
@@ -15,6 +25,9 @@ export interface ModelOption {
 export interface ModelSettings {
   modelId: string;
   effort: ModelEffort;
+  retrievalMode: RetrievalMode;
+  retrievalPool: RetrievalPool;
+  subgraphMaxNodes: number;
 }
 
 export interface ModelSettingsResponse {
@@ -71,6 +84,11 @@ export interface RagArchiveEntry {
   /** Revision of the last successful model archived for this job. */
   revision?: number;
   updatedAt?: string;
+  indexStatus?: "pending" | "indexing" | "ready" | "failed";
+  indexTaskId?: string;
+  indexError?: string;
+  indexedRevision?: number;
+  indexedAt?: string;
 }
 
 export interface JobError {
@@ -99,8 +117,30 @@ export interface Job {
   modelId?: string;
   modelProvider?: string;
   effort?: ModelEffort;
+  retrievalMode?: RetrievalMode;
+  retrievalPool?: RetrievalPool;
+  subgraphMaxNodes?: number;
   /** Incremented for each user-requested modification of the same job. */
   revision?: number;
+}
+
+export type CadirToolName = "cadir_retrieve" | "cadir_case_read";
+export type ToolActivityStatus = "running" | "completed" | "failed";
+
+export interface ToolActivity {
+  id: string;
+  tool: CadirToolName;
+  status: ToolActivityStatus;
+  /** Character offset in StageRun.output when the tool call started. */
+  outputOffset?: number;
+  /** Authoritative JobEvent sequence that anchors this call in the stage stream. */
+  orderSeq?: number;
+  query?: string;
+  caseId?: string;
+  resultCount?: number;
+  summary?: string;
+  startedAt: string;
+  completedAt?: string;
 }
 
 export interface StageRun {
@@ -115,6 +155,7 @@ export interface StageRun {
   output?: string;
   error?: JobError;
   toolError?: JobError;
+  toolActivities?: ToolActivity[];
   usage: TokenUsage;
   /** Cumulative OpenCode usage observed when this attempt started. */
   usageBaseline?: TokenUsage;
@@ -165,6 +206,9 @@ export interface Upload {
 export type EventType =
   | "job.started" | "stage.updated" | "message.started" | "message.delta"
   | "message.completed" | "tool.updated" | "usage.updated" | "image.read"
+  | "retrieval.started" | "retrieval.completed" | "retrieval.failed"
+  | "case.read.started" | "case.read.completed" | "case.read.failed"
+  | "case.index.requested" | "case.index.completed" | "case.index.failed"
   | "artifact.created" | "job.needs_input" | "job.completed" | "job.failed" | "job.cancelled";
 
 export interface JobEvent {

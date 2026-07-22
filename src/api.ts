@@ -8,6 +8,8 @@ export type JobStatus =
 
 export type StageKey = "requirements" | "codegen" | "visual" | "evolution";
 export type ModelEffort = "low" | "medium" | "high";
+export type RetrievalMode = "none" | "full" | "full_and_subgraph";
+export type RetrievalPool = "base" | "dynamic" | "both";
 
 export type StageStatus =
   | "pending"
@@ -46,6 +48,9 @@ export interface Job {
   modelId?: string;
   modelProvider?: string;
   effort?: ModelEffort;
+  retrievalMode?: RetrievalMode;
+  retrievalPool?: RetrievalPool;
+  subgraphMaxNodes?: number;
   revision?: number;
 }
 
@@ -60,12 +65,29 @@ export interface ModelOption {
 export interface ModelSettings {
   modelId: string;
   effort: ModelEffort;
+  retrievalMode: RetrievalMode;
+  retrievalPool: RetrievalPool;
+  subgraphMaxNodes: number;
 }
 
 export interface ModelSettingsResponse {
   settings: ModelSettings;
   models: ModelOption[];
   efforts: ModelEffort[];
+}
+
+export interface ToolActivity {
+  id: string;
+  tool: "cadir_retrieve" | "cadir_case_read";
+  status: "running" | "completed" | "failed";
+  outputOffset?: number;
+  orderSeq?: number;
+  query?: string;
+  caseId?: string;
+  resultCount?: number;
+  summary?: string;
+  startedAt: string;
+  completedAt?: string;
 }
 
 export interface StageRun {
@@ -82,6 +104,7 @@ export interface StageRun {
   // Client-only incremental presentation fields. Snapshots may omit them.
   output?: string;
   lines?: string[];
+  toolActivities?: ToolActivity[];
   error?: ApiErrorShape | null;
   toolError?: ApiErrorShape | null;
 }
@@ -351,6 +374,15 @@ const eventNames = [
   "message.delta",
   "message.completed",
   "tool.updated",
+  "retrieval.started",
+  "retrieval.completed",
+  "retrieval.failed",
+  "case.read.started",
+  "case.read.completed",
+  "case.read.failed",
+  "case.index.requested",
+  "case.index.completed",
+  "case.index.failed",
   "usage.updated",
   "image.read",
   "artifact.created",

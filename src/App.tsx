@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  BookOpen,
   Bot,
   Check,
   ChevronDown,
@@ -10,9 +11,12 @@ import {
   Image,
   LoaderCircle,
   MessageSquarePlus,
+  Minus,
   Paperclip,
+  Plus,
   RefreshCw,
   Send,
+  Search,
   Settings2,
   Square,
   Trash2,
@@ -23,7 +27,7 @@ import {
 } from "lucide-react";
 import StlViewer from "./StlViewer";
 import { groupStageRuns } from "./stageGroups";
-import { stageOutputLines } from "./stageStream";
+import { stageTimelineItems } from "./stageTimeline";
 import {
   api,
   type Artifact,
@@ -37,9 +41,12 @@ import {
   type ModelEffort,
   type ModelSettings,
   type ModelSettingsResponse,
+  type RetrievalMode,
+  type RetrievalPool,
   type StageKey,
   type StageRun,
   type StreamEvent,
+  type ToolActivity,
 } from "./api";
 
 type PendingImage = {
@@ -61,13 +68,34 @@ const stageNames: Record<StageKey, string> = {
   evolution: "自进化",
 };
 
+function normalizeModelSettings(settings: Partial<ModelSettings>): ModelSettings {
+  return {
+    modelId: settings.modelId ?? "gpt-5.6-sol",
+    effort: settings.effort ?? "medium",
+    retrievalMode: settings.retrievalMode ?? "full_and_subgraph",
+    retrievalPool: settings.retrievalPool ?? "both",
+    subgraphMaxNodes: settings.subgraphMaxNodes ?? 16,
+  };
+}
+
 function normalizeSnapshot(snapshot: JobSnapshot): JobSnapshot {
   const emptyUsage = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
   return {
     ...snapshot,
-    job: { ...snapshot.job, revision: snapshot.job.revision ?? 1 },
+    job: {
+      ...snapshot.job,
+      revision: snapshot.job.revision ?? 1,
+      retrievalMode: snapshot.job.retrievalMode ?? "full_and_subgraph",
+      retrievalPool: snapshot.job.retrievalPool ?? "both",
+      subgraphMaxNodes: snapshot.job.subgraphMaxNodes ?? 16,
+    },
     lastSeq: Number(snapshot.lastSeq ?? 0),
-    stageRuns: Array.isArray(snapshot.stageRuns) ? snapshot.stageRuns.map((stage) => ({ ...stage, revision: stage.revision ?? 1, usage: stage.usage ?? { ...emptyUsage } })) : [],
+    stageRuns: Array.isArray(snapshot.stageRuns) ? snapshot.stageRuns.map((stage) => ({
+      ...stage,
+      revision: stage.revision ?? 1,
+      usage: stage.usage ?? { ...emptyUsage },
+      toolActivities: Array.isArray(stage.toolActivities) ? stage.toolActivities : [],
+    })) : [],
     messages: Array.isArray(snapshot.messages) ? snapshot.messages.map((message) => ({ ...message, imageArtifactIds: message.imageArtifactIds ?? [] })) : [],
     artifacts: Array.isArray(snapshot.artifacts) ? snapshot.artifacts.map((artifact) => ({ ...artifact, revision: artifact.revision ?? 1 })) : [],
     usage: snapshot.usage ?? emptyUsage,
@@ -158,6 +186,25 @@ function reduceStreamEvent(current: JobSnapshot | null, event: StreamEvent): Job
           toolError: data.clearToolError === true ? undefined : (toolError ?? stage.toolError),
         };
       }
+    }
+  }
+
+  if (["retrieval.started", "retrieval.completed", "retrieval.failed", "case.read.started", "case.read.completed", "case.read.failed"].includes(event.type)) {
+    const activity = (data.activity && typeof data.activity === "object" ? data.activity : undefined) as ToolActivity | undefined;
+    const stageRunId = String(data.stageRunId ?? "");
+    const stageKey = (data.stage ?? next.job.currentStage) as StageKey | undefined;
+    const reverseIndex = [...next.stageRuns].reverse().findIndex((stage) =>
+      (stageRunId && stage.id === stageRunId)
+      || (!stageRunId && stage.stage === stageKey && (stage.revision ?? 1) === (next.job.revision ?? 1)),
+    );
+    if (activity?.id && reverseIndex >= 0) {
+      const actualIndex = next.stageRuns.length - 1 - reverseIndex;
+      const stage = next.stageRuns[actualIndex];
+      const activities = [...(stage.toolActivities ?? [])];
+      const activityIndex = activities.findIndex((item) => item.id === activity.id);
+      if (activityIndex >= 0) activities[activityIndex] = { ...activities[activityIndex], ...activity };
+      else activities.push(activity);
+      next.stageRuns[actualIndex] = { ...stage, toolActivities: activities };
     }
   }
 
@@ -253,6 +300,37 @@ function stageStatusIcon(status: StageRun["status"]) {
   return <span className="pending-dot" />;
 }
 
+function ToolActivityItem({ activity }: { activity: ToolActivity }) {
+  const retrieve = activity.tool === "cadir_retrieve";
+  const label = activity.tool;
+  const state = activity.status === "running"
+    ? "正在执行"
+    : activity.status === "failed"
+      ? "执行失败"
+      : retrieve
+        ? `找到 ${activity.resultCount ?? 0} 个结果`
+        : `已读取 ${activity.caseId ?? "Case"}`;
+  const fallback = activity.status === "running"
+    ? (retrieve ? `查询：${activity.query ?? "当前建模需求"}` : `正在读取 ${activity.caseId ?? "CAD Case"}`)
+    : activity.status === "failed"
+      ? "工具执行失败，建模流程将根据当前状态继续。"
+      : retrieve
+        ? `已完成相似 Case 检索，共返回 ${activity.resultCount ?? 0} 个结果。`
+        : `已读取 ${activity.caseId ?? "CAD Case"}。`;
+  return (
+    <details className={`tool-activity ${activity.status}`}>
+      <summary>
+        <span className="tool-activity-chevron"><ChevronRight size={14} /></span>
+        <span className="tool-activity-icon">{retrieve ? <Search size={14} /> : <BookOpen size={14} />}</span>
+        <span className="tool-activity-name">{label}</span>
+        <span className="tool-activity-state">{state}</span>
+        <span className="tool-activity-status">{activity.status === "running" ? <LoaderCircle className="spin" size={13} /> : activity.status === "failed" ? <CircleAlert size={13} /> : <Check size={13} />}</span>
+      </summary>
+      <p>{activity.summary ?? fallback}</p>
+    </details>
+  );
+}
+
 function SessionStatus({ status }: { status?: ConversationSummary["latestJobStatus"] }) {
   if (status === "running" || status === "queued") return <LoaderCircle className="spin session-state running" size={14} />;
   if (status === "completed") return <Check className="session-state completed" size={14} />;
@@ -325,7 +403,7 @@ function completionSummary(summary?: string) {
   if (!normalized) return fallback;
 
   const markers = [
-    /发布清单(?:精确)?路径/i,
+    /发布(?:清单(?:精确)?)?路径/i,
     /(?:产物|文件)(?:清单)?路径/i,
     /\brequirements\s*=/i,
     /\/workspace\/jobs\//i,
@@ -387,9 +465,10 @@ export default function App() {
     if (showStatus) setSettingsStatus((current) => current === "saving" ? current : "loading");
     try {
       const response = await api.getSettings();
-      setModelSettings(response.settings);
+      const settings = normalizeModelSettings(response.settings);
+      setModelSettings(settings);
       setModelOptions(response.models);
-      setSettingsDraft((current) => current ?? response.settings);
+      setSettingsDraft((current) => current ?? settings);
       setSettingsError(undefined);
       if (showStatus) setSettingsStatus("idle");
     } catch (error) {
@@ -702,9 +781,10 @@ export default function App() {
     setSettingsError(undefined);
     try {
       const response = await api.updateSettings(settingsDraft);
-      setModelSettings(response.settings);
+      const settings = normalizeModelSettings(response.settings);
+      setModelSettings(settings);
       setModelOptions(response.models);
-      setSettingsDraft(response.settings);
+      setSettingsDraft(settings);
       setSettingsStatus("saved");
     } catch (error) {
       setSettingsError(error instanceof Error ? error.message : "模型设置保存失败");
@@ -821,8 +901,10 @@ export default function App() {
                         <div className="stage-stream">
                           {group.runs.map((run, attemptIndex) => (
                             <div className="stage-attempt" key={run.id}>
-                              <div className="stream-lines" aria-live={run.id === stage.id && stageActive ? "polite" : "off"}>
-                                {stageOutputLines(run).map((line, index) => <div className="stream-line" key={`${run.id}-${index}`}><span className="stream-dot" /><span>{line}</span></div>)}
+                              <div className="stream-timeline" aria-live={run.id === stage.id && stageActive ? "polite" : "off"} aria-label="阶段执行记录">
+                                {stageTimelineItems(run).map((item) => item.kind === "tool"
+                                  ? <ToolActivityItem activity={item.activity} key={item.id} />
+                                  : item.lines.map((line, index) => <div className="stream-line" key={`${run.id}-${item.id}-${index}`}><span className="stream-dot" /><span>{line}</span></div>))}
                               </div>
                               {run.status === "failed" && run.error && (
                                 <div className="stage-attempt-error"><CircleAlert size={14} /><div><strong>执行报错{group.runs.length > 1 ? ` · 第 ${attemptIndex + 1} 次` : ""}</strong><p>{run.error.message}</p><ErrorDetails error={run.error} /></div></div>
@@ -924,7 +1006,7 @@ export default function App() {
                 const nextModel = modelOptions.find((item) => item.id === event.target.value);
                 if (!nextModel || !settingsDraft) return;
                 const nextEffort = nextModel.efforts.includes(settingsDraft.effort) ? settingsDraft.effort : (nextModel.efforts[0] ?? "medium");
-                setSettingsDraft({ modelId: nextModel.id, effort: nextEffort });
+                setSettingsDraft((current) => current ? { ...current, modelId: nextModel.id, effort: nextEffort } : current);
               }}
             >
               {!modelOptions.length && <option value="">暂无可用模型</option>}
@@ -939,13 +1021,67 @@ export default function App() {
               ))}
             </div>
           </fieldset>
-          <p className="settings-note">设置会应用到下一次新建或修改请求，正在运行的任务不会切换模型。</p>
+          <div className="settings-section-heading">检索设置</div>
+          <fieldset className="settings-field retrieval-field">
+            <legend>检索方式</legend>
+            <div className="retrieval-options">
+              {([
+                ["none", "无检索"],
+                ["full", "仅完整检索"],
+                ["full_and_subgraph", "完整 + 子图"],
+              ] as Array<[RetrievalMode, string]>).map(([mode, label]) => (
+                <button
+                  className={settingsDraft?.retrievalMode === mode ? "retrieval-option selected" : "retrieval-option"}
+                  type="button"
+                  key={mode}
+                  disabled={settingsStatus === "saving"}
+                  onClick={() => setSettingsDraft((current) => current ? { ...current, retrievalMode: mode } : current)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </fieldset>
+          <fieldset className="settings-field retrieval-field">
+            <legend>检索库</legend>
+            <div className="retrieval-options">
+              {([
+                ["base", "基础库"],
+                ["dynamic", "动态库"],
+                ["both", "基础 + 动态"],
+              ] as Array<[RetrievalPool, string]>).map(([pool, label]) => (
+                <button
+                  className={settingsDraft?.retrievalPool === pool ? "retrieval-option selected" : "retrieval-option"}
+                  type="button"
+                  key={pool}
+                  disabled={settingsStatus === "saving" || settingsDraft?.retrievalMode === "none"}
+                  onClick={() => setSettingsDraft((current) => current ? { ...current, retrievalPool: pool } : current)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </fieldset>
+          {settingsDraft?.retrievalMode === "full_and_subgraph" && (
+            <label className="settings-field subgraph-limit-field">
+              <span>最大子图节点数</span>
+              <div className="number-stepper">
+                <button type="button" aria-label="减少最大子图节点数" title="减少" disabled={settingsStatus === "saving" || settingsDraft.subgraphMaxNodes <= 3} onClick={() => setSettingsDraft((current) => current ? { ...current, subgraphMaxNodes: Math.max(3, current.subgraphMaxNodes - 1) } : current)}><Minus size={14} /></button>
+                <input type="number" min={3} max={64} step={1} value={settingsDraft.subgraphMaxNodes} disabled={settingsStatus === "saving"} onChange={(event) => {
+                  const value = Number(event.target.value);
+                  if (Number.isSafeInteger(value)) setSettingsDraft((current) => current ? { ...current, subgraphMaxNodes: Math.min(64, Math.max(3, value)) } : current);
+                }} />
+                <button type="button" aria-label="增加最大子图节点数" title="增加" disabled={settingsStatus === "saving" || settingsDraft.subgraphMaxNodes >= 64} onClick={() => setSettingsDraft((current) => current ? { ...current, subgraphMaxNodes: Math.min(64, current.subgraphMaxNodes + 1) } : current)}><Plus size={14} /></button>
+              </div>
+            </label>
+          )}
+          <p className="settings-note">模型与检索设置会应用到下一次新建或修改请求，正在运行的任务保持当前配置。</p>
           {settingsError && <div className="settings-error"><CircleAlert size={14} /> {settingsError}</div>}
           <div className="settings-footer">
             <span className={`settings-state ${settingsStatus}`}>{settingsStatus === "loading" ? "正在读取" : settingsStatus === "saving" ? "正在保存" : settingsStatus === "saved" ? "已保存" : settingsStatus === "error" ? "保存失败" : ""}</span>
             <div className="settings-actions">
               <button className="secondary-button" type="button" disabled={settingsStatus === "saving"} onClick={() => { setSettingsDraft(modelSettings); setSettingsOpen(false); }}>取消</button>
-              <button className="settings-save" type="button" disabled={settingsStatus === "saving" || !settingsDraft || !modelOptions.length} onClick={() => void saveSettings()}>{settingsStatus === "saving" ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />} 保存</button>
+              <button className="settings-save" type="button" disabled={settingsStatus === "saving" || !settingsDraft} onClick={() => void saveSettings()}>{settingsStatus === "saving" ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />} 保存</button>
             </div>
           </div>
         </div>
