@@ -4,8 +4,11 @@
 
 - OpenCode is pinned to `opencode-ai@1.18.3` and starts with
   `opencode serve --hostname 0.0.0.0 --port 4096`.
-- The local `SimpleCADAPI-master.zip` source is installed with pip. The same
-  source bundle provides the complete project-level `simplecadapi` skill.
+- The local `SimpleCADAPI-master.zip` file contains the pinned
+  `So3Lab/CADIR` dev source at commit
+  `787a77df93dc446b5d9fb01e7fe2f615d3433334`; Docker installs its
+  `CADIR-dev` package. The same source bundle provides the complete
+  project-level `simplecadapi` skill.
 - Debian's `freecad` package supplies `/usr/bin/freecadcmd`. The runtime passes
   that executable to public `translate_model_json_to_fcstd`.
 - The supplied 2.0.1b1 ZIP documents that translator as a top-level export but
@@ -55,7 +58,16 @@ The smoke test is successful only when it creates `model.json`, `model.step`,
 OpenCode port 4096 is exposed only to the Compose network. It is intentionally
 not published on the Docker host; browsers communicate through the BFF.
 
-## Verified 2026-07-20
+## Verified 2026-07-23
+
+- Replaced the runtime bundle and Agent skill with the trusted
+  `So3Lab/CADIR` dev snapshot at commit
+  `787a77df93dc446b5d9fb01e7fe2f615d3433334`.
+- The runtime bundle exposes `apply_tag_rselection`, physical units, and
+  tolerance graph APIs; the skill bundle includes their generated reference
+  pages.
+
+## Previous verification (2026-07-20)
 
 - Built `cadir-opencode:latest` successfully with OpenCode 1.18.3, SimpleCADAPI
   2.0.1b1, cadquery-ocp 7.9.3.1.1, and Debian FreeCAD 0.20.2.

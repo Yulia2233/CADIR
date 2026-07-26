@@ -43,9 +43,13 @@ retrieval is enabled.
 3. Use only public SimpleCADAPI functions. Record every model inside
    `GraphSession`; canonical `export_model_json(session)` is the interchange
    boundary used by the runtime and FreeCAD translator.
-4. Use `apply_tag(shape, tag)` and `list_tags(shape)`, never member tag mutators.
-   Use QL for small grounding checks after each major modeling operation and
-   print only the selected facts needed for validation.
+4. Use `apply_tag(shape=..., tag=...)` for whole-shape tags and
+   `apply_tag_rselection(scope=..., targets=..., tag=...)` for explicit
+   semantic topology selections. Inspect them with `list_tags(shape=...,
+   scope=...)` or `explain_tag(shape=..., tag=..., scope=...)`; never use
+   member tag mutators. Use keyword arguments for every public SimpleCADAPI
+   call. Use QL for small grounding checks after each major modeling operation
+   and print only the selected facts needed for validation.
 5. Boolean operations return one Solid. Use `union_rsolid` for union and make
    intended joined bodies overlap slightly if necessary.
 6. Do not write rendering code. Visual feedback is produced exclusively by the
@@ -113,8 +117,11 @@ validates artifacts and persists authoritative state.
 
 When retrieval is enabled for the revision, call `cadir_retrieve` once with the
 current user requirement before writing or repairing `model.py`. The backend
-automatically applies the user's full-model/subgraph mode, subgraph node limit,
-and current user-uploaded images. Review the unique Case summaries, then call
+automatically applies the user's retrieval mode and Case-library selection. In
+hybrid mode that one call retrieves the configured number of summary-text and
+3D-subgraph matches, applies the subgraph node limit, and reports each result's
+source; do not issue separate retrieval calls for the two branches. Other modes
+also apply current user-uploaded images when configured. Review the unique Case summaries, then call
 `cadir_case_read` for at most the one or two most relevant Cases or matched
 subgraphs. Treat retrieved code and geometry as references: adapt them to the
 current requirements and validate the result with `cadir_run`. If retrieval is
@@ -137,27 +144,31 @@ without it; never fail or pause the job solely because retrieval failed.
    uncertain APIs, call `cadir_run`, and call `cadir_stage(codegen, complete)`.
    The backend starts a new visual attempt. Inspect all four new images. Do not
    fork work.
-5. Repeat codegen -> visual until the model passes. On pass, call
-   `cadir_stage(visual, complete)`. The backend starts one final `evolution`
-   review. Before overwriting them, read any existing `summary.md` and
-   `experience.md`. Rewrite both files as cumulative documents for the current
-   final model. `summary.md` must concisely record the original normalized
-   requirement, every completed user-requested modification in order, final
-   geometry and dimensions, validation measurements, and visual result. It must
-   describe the consolidated final state rather than merely concatenate old
-   prose. `experience.md` must retain still-relevant experience from earlier
-   revisions and add reusable modeling choices, SimpleCADAPI calls that worked,
-   execution or visual failures and their repairs, verification strategy, and
-   known limitations from the current revision. These documents must contain
-   engineering conclusions only, never hidden reasoning or chain-of-thought.
-   Call `cadir_publish` exactly once per revision, and only then call
-   `cadir_stage(evolution, complete)`. Because the latest visual attempt passed,
-   this final transition validates STEP/STL/FCStd, `manifest.json`, both
-   knowledge documents, and the independent RAG archive before marking the job
-   complete. The final evolution `summary` must include the exact
-   publish-manifest paths for requirements, Python, model JSON, STEP, STL,
-   FreeCAD, and all four images; this makes the terminal `job.completed` event
-   self-contained even if the browser reconnects before the final prose arrives.
+5. Repeat codegen -> visual until the model passes. Follow the workflow policy
+   injected into the request for this revision. If self-evolution is enabled,
+   call `cadir_stage(visual, complete)`, then perform one final evolution review.
+   Before overwriting them, read any existing `summary.md` and `experience.md`.
+   Rewrite both files as cumulative documents for the current final model.
+   `summary.md` must concisely record the original normalized requirement, every
+   completed user-requested modification in order, final geometry and dimensions,
+   validation measurements, and visual result. It must describe the consolidated
+   final state rather than merely concatenate old prose. `experience.md` must
+   retain still-relevant experience from earlier revisions and add reusable
+   modeling choices, SimpleCADAPI calls that worked, execution or visual failures
+   and their repairs, verification strategy, and known limitations from the
+   current revision. These documents must contain engineering conclusions only,
+   never hidden reasoning or chain-of-thought. Call `cadir_publish` exactly once
+   per revision, and only then call `cadir_stage(evolution, complete)`.
+   If self-evolution is disabled, do not create or complete an evolution stage.
+   After visual checks pass, update the same cumulative documents, call
+   `cadir_publish` exactly once while visual is still active, and then call
+   `cadir_stage(visual, complete)`. The backend will validate STEP/STL/FCStd,
+   `manifest.json`, and both knowledge documents and complete the job directly;
+   it will not create a dynamic RAG Case for this revision. In either mode, the
+   final completion summary must include the exact publish-manifest paths for
+   requirements, Python, model JSON, STEP, STL, FreeCAD, and all four images;
+   this makes the terminal `job.completed` event self-contained even if the
+   browser reconnects before the final prose arrives.
 6. If a requirement is materially ambiguous, explain the decision needed and
    stop for the user's answer. If the task cannot continue, report the phase as
    `failed` with the exact concise error.

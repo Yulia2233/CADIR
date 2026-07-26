@@ -9,6 +9,8 @@ export interface AppConfig {
   corsOrigin: string;
   heartbeatMs: number;
   watchdogMs: number;
+  /** Time to drain in-flight CAD tool callbacks after an OpenCode failure. */
+  failureGraceMs?: number;
   openCodeUrl?: string;
   openCodeUsername: string;
   openCodePassword?: string;
@@ -31,6 +33,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     corsOrigin: env.CORS_ORIGIN ?? "http://localhost:5173",
     heartbeatMs: Number(env.SSE_HEARTBEAT_MS ?? 15_000),
     watchdogMs: Number(env.OPENCODE_WATCHDOG_MS ?? 120_000),
+    failureGraceMs: Number(env.OPENCODE_FAILURE_GRACE_MS ?? 15_000),
     openCodeUrl: env.OPENCODE_URL,
     openCodeUsername: env.OPENCODE_SERVER_USERNAME ?? "opencode",
     openCodePassword: env.OPENCODE_SERVER_PASSWORD,

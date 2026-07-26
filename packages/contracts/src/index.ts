@@ -4,7 +4,7 @@ export type Stage = (typeof STAGES)[number];
 export const MODEL_EFFORTS = ["low", "medium", "high"] as const;
 export type ModelEffort = (typeof MODEL_EFFORTS)[number];
 
-export const RETRIEVAL_MODES = ["none", "full", "full_and_subgraph"] as const;
+export const RETRIEVAL_MODES = ["none", "full", "full_and_subgraph", "hybrid"] as const;
 export type RetrievalMode = (typeof RETRIEVAL_MODES)[number];
 export const RETRIEVAL_POOLS = ["base", "dynamic", "both"] as const;
 export type RetrievalPool = (typeof RETRIEVAL_POOLS)[number];
@@ -13,6 +13,10 @@ export type RetrievalSource = (typeof RETRIEVAL_SOURCES)[number];
 export const DEFAULT_SUBGRAPH_MAX_NODES = 16;
 export const MIN_SUBGRAPH_MAX_NODES = 3;
 export const MAX_SUBGRAPH_MAX_NODES = 64;
+export const DEFAULT_RETRIEVAL_TEXT_TOP_K = 5;
+export const DEFAULT_RETRIEVAL_SUBGRAPH_TOP_K = 5;
+export const MIN_RETRIEVAL_TOP_K = 1;
+export const MAX_RETRIEVAL_TOP_K = 100;
 
 export interface ModelOption {
   id: string;
@@ -25,9 +29,12 @@ export interface ModelOption {
 export interface ModelSettings {
   modelId: string;
   effort: ModelEffort;
+  selfEvolutionEnabled: boolean;
   retrievalMode: RetrievalMode;
   retrievalPool: RetrievalPool;
   subgraphMaxNodes: number;
+  retrievalTextTopK: number;
+  retrievalSubgraphTopK: number;
 }
 
 export interface ModelSettingsResponse {
@@ -117,9 +124,12 @@ export interface Job {
   modelId?: string;
   modelProvider?: string;
   effort?: ModelEffort;
+  selfEvolutionEnabled?: boolean;
   retrievalMode?: RetrievalMode;
   retrievalPool?: RetrievalPool;
   subgraphMaxNodes?: number;
+  retrievalTextTopK?: number;
+  retrievalSubgraphTopK?: number;
   /** Incremented for each user-requested modification of the same job. */
   revision?: number;
 }

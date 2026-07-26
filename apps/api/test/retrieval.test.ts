@@ -7,7 +7,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import type { AppConfig } from "../src/config.js";
-import { HttpRetrievalAdapter, type RetrievalQueryOptions } from "../src/retrieval.js";
+import { HttpRetrievalAdapter, type HybridRetrievalQueryOptions, type RetrievalQueryOptions } from "../src/retrieval.js";
 
 async function requestBody(request: IncomingMessage): Promise<Buffer> {
   const chunks: Buffer[] = [];
@@ -35,6 +35,10 @@ test("HTTP retrieval adapter matches the text, image, index, and Case contracts"
     if (request.url === "/v1/retrieve/text") return sendJson(response, {
       returnedCount: 1,
       results: [{ caseId: "case-1", score: 0.9 }],
+    });
+    if (request.url === "/v1/retrieve/hybrid") return sendJson(response, {
+      returnedCount: 1,
+      results: [{ caseId: "case-hybrid", matchKind: "summary_text+subgraph", provenance: ["summary_text", "subgraph"] }],
     });
     if (request.url === "/v1/retrieve/image") return sendJson(response, {
       returnedCount: 1,
@@ -65,6 +69,11 @@ test("HTTP retrieval adapter matches the text, image, index, and Case contracts"
     assert.equal(await adapter.health(), true);
     const options: RetrievalQueryOptions = { scope: "full_and_subgraph", sources: ["base", "dynamic"], topK: 5, subgraphMaxNodes: 16, excludeCaseIds: ["current"] };
     assert.equal((await adapter.retrieveText("flange", options)).results[0].caseId, "case-1");
+    const hybridOptions: HybridRetrievalQueryOptions = {
+      sources: ["base"], textTopK: 3, subgraphTopK: 4, subgraphMaxNodes: 20,
+      excludeCaseIds: ["current"], requestId: "request-1", jobId: "job-1", revision: 2,
+    };
+    assert.equal((await adapter.retrieveHybrid("flange", hybridOptions)).results[0].caseId, "case-hybrid");
     assert.equal((await adapter.retrieveImage({
       bytes: Uint8Array.from([137, 80, 78, 71]), filename: "query.png", mimeType: "image/png",
     }, options)).results[0].caseId, "case-2");
@@ -88,6 +97,11 @@ test("HTTP retrieval adapter matches the text, image, index, and Case contracts"
   const textRequest = requests.find((request) => request.url === "/v1/retrieve/text");
   assert.deepEqual(JSON.parse(textRequest!.body.toString("utf8")), {
     query: "flange", scope: "full_and_subgraph", sources: ["base", "dynamic"], topK: 5, subgraphMaxNodes: 16, excludeCaseIds: ["current"],
+  });
+  const hybridRequest = requests.find((request) => request.url === "/v1/retrieve/hybrid");
+  assert.deepEqual(JSON.parse(hybridRequest!.body.toString("utf8")), {
+    query: "flange", sources: ["base"], textTopK: 3, subgraphTopK: 4, subgraphMaxNodes: 20,
+    excludeCaseIds: ["current"], requestId: "request-1", jobId: "job-1", revision: 2,
   });
   const imageRequest = requests.find((request) => request.url === "/v1/retrieve/image");
   assert.match(imageRequest!.contentType ?? "", /^multipart\/form-data; boundary=/);

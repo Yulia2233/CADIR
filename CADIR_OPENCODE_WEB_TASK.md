@@ -2,7 +2,9 @@
 
 > 文档状态：v0.2，已加入独立的构造图 Case 检索服务设计。
 >
-> 依据：工作区论文 `CADIR_AAAI2026 (7).pdf`、`SimpleCADAPI-master.zip`，以及 OpenCode 当前官方 Server、SDK、Agent、Custom Tools 文档。
+> 依据：工作区论文 `CADIR_AAAI2026 (7).pdf`、固定为 `So3Lab/CADIR` dev 提交
+> `787a77df93dc446b5d9fb01e7fe2f615d3433334` 的 `SimpleCADAPI-master.zip`，以及
+> OpenCode 当前官方 Server、SDK、Agent、Custom Tools 文档。
 
 ## 1. 项目目标
 
@@ -129,7 +131,8 @@ BFF 不实现模型推理，只负责身份校验、任务管理、OpenCode Serv
 ### 5.3 CAD 执行环境
 
 - Python 3.11（最终以 SimpleCADAPI 实际支持版本为准）。
-- `simplecadapi==2.0.1b1` 或从工作区源码锁定安装。
+- 固定安装工作区 ZIP 中 `So3Lab/CADIR` dev 提交
+  `787a77df93dc446b5d9fb01e7fe2f615d3433334` 的 SimpleCADAPI 源码。
 - OCP/OCCT 依赖。
 - FreeCADCmd，无 GUI 运行。
 - 可选底层显示依赖：Mesa、Xvfb；仅用于让 SimpleCADAPI `render_screenshot_rpath(...)` 在 headless Docker 中正常运行，不作为替代渲染器。

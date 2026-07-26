@@ -26,6 +26,13 @@ import {
   X,
 } from "lucide-react";
 import StlViewer from "./StlViewer";
+import {
+  MAX_RETRIEVAL_TOP_K,
+  MAX_SUBGRAPH_MAX_NODES,
+  MIN_RETRIEVAL_TOP_K,
+  MIN_SUBGRAPH_MAX_NODES,
+  normalizeModelSettings,
+} from "./retrievalSettings";
 import { groupStageRuns } from "./stageGroups";
 import { stageTimelineItems } from "./stageTimeline";
 import {
@@ -68,14 +75,44 @@ const stageNames: Record<StageKey, string> = {
   evolution: "自进化",
 };
 
-function normalizeModelSettings(settings: Partial<ModelSettings>): ModelSettings {
-  return {
-    modelId: settings.modelId ?? "gpt-5.6-sol",
-    effort: settings.effort ?? "medium",
-    retrievalMode: settings.retrievalMode ?? "full_and_subgraph",
-    retrievalPool: settings.retrievalPool ?? "both",
-    subgraphMaxNodes: settings.subgraphMaxNodes ?? 16,
-  };
+function NumberStepper({
+  label,
+  value,
+  minimum,
+  maximum,
+  disabled,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  minimum: number;
+  maximum: number;
+  disabled: boolean;
+  onChange: (value: number) => void;
+}) {
+  const update = (value: number) => onChange(Math.min(maximum, Math.max(minimum, Math.trunc(value))));
+  return (
+    <label className="settings-field retrieval-number-field">
+      <span>{label}</span>
+      <div className="number-stepper">
+        <button type="button" aria-label={`减少${label}`} title="减少" disabled={disabled || value <= minimum} onClick={() => update(value - 1)}><Minus size={14} /></button>
+        <input
+          type="number"
+          min={minimum}
+          max={maximum}
+          step={1}
+          value={value}
+          disabled={disabled}
+          aria-label={label}
+          onChange={(event) => {
+            const next = Number(event.target.value);
+            if (Number.isSafeInteger(next)) update(next);
+          }}
+        />
+        <button type="button" aria-label={`增加${label}`} title="增加" disabled={disabled || value >= maximum} onClick={() => update(value + 1)}><Plus size={14} /></button>
+      </div>
+    </label>
+  );
 }
 
 function normalizeSnapshot(snapshot: JobSnapshot): JobSnapshot {
@@ -87,6 +124,8 @@ function normalizeSnapshot(snapshot: JobSnapshot): JobSnapshot {
       revision: snapshot.job.revision ?? 1,
       retrievalMode: snapshot.job.retrievalMode ?? "full_and_subgraph",
       retrievalPool: snapshot.job.retrievalPool ?? "both",
+      retrievalTextTopK: snapshot.job.retrievalTextTopK ?? 5,
+      retrievalSubgraphTopK: snapshot.job.retrievalSubgraphTopK ?? 5,
       subgraphMaxNodes: snapshot.job.subgraphMaxNodes ?? 16,
     },
     lastSeq: Number(snapshot.lastSeq ?? 0),
@@ -1024,11 +1063,12 @@ export default function App() {
           <div className="settings-section-heading">检索设置</div>
           <fieldset className="settings-field retrieval-field">
             <legend>检索方式</legend>
-            <div className="retrieval-options">
+            <div className="retrieval-options retrieval-mode-options">
               {([
                 ["none", "无检索"],
                 ["full", "仅完整检索"],
                 ["full_and_subgraph", "完整 + 子图"],
+                ["hybrid", "混合检索"],
               ] as Array<[RetrievalMode, string]>).map(([mode, label]) => (
                 <button
                   className={settingsDraft?.retrievalMode === mode ? "retrieval-option selected" : "retrieval-option"}
@@ -1062,20 +1102,63 @@ export default function App() {
               ))}
             </div>
           </fieldset>
-          {settingsDraft?.retrievalMode === "full_and_subgraph" && (
-            <label className="settings-field subgraph-limit-field">
-              <span>最大子图节点数</span>
-              <div className="number-stepper">
-                <button type="button" aria-label="减少最大子图节点数" title="减少" disabled={settingsStatus === "saving" || settingsDraft.subgraphMaxNodes <= 3} onClick={() => setSettingsDraft((current) => current ? { ...current, subgraphMaxNodes: Math.max(3, current.subgraphMaxNodes - 1) } : current)}><Minus size={14} /></button>
-                <input type="number" min={3} max={64} step={1} value={settingsDraft.subgraphMaxNodes} disabled={settingsStatus === "saving"} onChange={(event) => {
-                  const value = Number(event.target.value);
-                  if (Number.isSafeInteger(value)) setSettingsDraft((current) => current ? { ...current, subgraphMaxNodes: Math.min(64, Math.max(3, value)) } : current);
-                }} />
-                <button type="button" aria-label="增加最大子图节点数" title="增加" disabled={settingsStatus === "saving" || settingsDraft.subgraphMaxNodes >= 64} onClick={() => setSettingsDraft((current) => current ? { ...current, subgraphMaxNodes: Math.min(64, current.subgraphMaxNodes + 1) } : current)}><Plus size={14} /></button>
-              </div>
-            </label>
+          {settingsDraft?.retrievalMode === "hybrid" && (
+            <div className="hybrid-retrieval-settings" aria-label="混合检索参数">
+              <NumberStepper
+                label="文本检索数量"
+                value={settingsDraft.retrievalTextTopK}
+                minimum={MIN_RETRIEVAL_TOP_K}
+                maximum={MAX_RETRIEVAL_TOP_K}
+                disabled={settingsStatus === "saving"}
+                onChange={(value) => setSettingsDraft((current) => current ? { ...current, retrievalTextTopK: value } : current)}
+              />
+              <NumberStepper
+                label="子图检索数量"
+                value={settingsDraft.retrievalSubgraphTopK}
+                minimum={MIN_RETRIEVAL_TOP_K}
+                maximum={MAX_RETRIEVAL_TOP_K}
+                disabled={settingsStatus === "saving"}
+                onChange={(value) => setSettingsDraft((current) => current ? { ...current, retrievalSubgraphTopK: value } : current)}
+              />
+              <NumberStepper
+                label="最大子图节点数"
+                value={settingsDraft.subgraphMaxNodes}
+                minimum={MIN_SUBGRAPH_MAX_NODES}
+                maximum={MAX_SUBGRAPH_MAX_NODES}
+                disabled={settingsStatus === "saving"}
+                onChange={(value) => setSettingsDraft((current) => current ? { ...current, subgraphMaxNodes: value } : current)}
+              />
+            </div>
           )}
-          <p className="settings-note">模型与检索设置会应用到下一次新建或修改请求，正在运行的任务保持当前配置。</p>
+          {settingsDraft?.retrievalMode === "full_and_subgraph" && (
+            <NumberStepper
+              label="最大子图节点数"
+              value={settingsDraft.subgraphMaxNodes}
+              minimum={MIN_SUBGRAPH_MAX_NODES}
+              maximum={MAX_SUBGRAPH_MAX_NODES}
+              disabled={settingsStatus === "saving"}
+              onChange={(value) => setSettingsDraft((current) => current ? { ...current, subgraphMaxNodes: value } : current)}
+            />
+          )}
+          <div className="settings-section-heading">工作流设置</div>
+          <div className="workflow-setting">
+            <div className="workflow-setting-copy">
+              <strong>自进化</strong>
+              <span>{settingsDraft?.selfEvolutionEnabled ? "视觉验证后归档并更新动态库" : "视觉验证后直接完成，不写入动态库"}</span>
+            </div>
+            <button
+              className={settingsDraft?.selfEvolutionEnabled ? "settings-switch on" : "settings-switch"}
+              type="button"
+              role="switch"
+              aria-checked={settingsDraft?.selfEvolutionEnabled ?? true}
+              aria-label="自进化"
+              disabled={settingsStatus === "saving"}
+              onClick={() => setSettingsDraft((current) => current ? { ...current, selfEvolutionEnabled: !current.selfEvolutionEnabled } : current)}
+            >
+              <span />
+            </button>
+          </div>
+          <p className="settings-note">模型、检索与工作流设置会应用到下一次新建或修改请求，正在运行的任务保持当前配置。</p>
           {settingsError && <div className="settings-error"><CircleAlert size={14} /> {settingsError}</div>}
           <div className="settings-footer">
             <span className={`settings-state ${settingsStatus}`}>{settingsStatus === "loading" ? "正在读取" : settingsStatus === "saving" ? "正在保存" : settingsStatus === "saved" ? "已保存" : settingsStatus === "error" ? "保存失败" : ""}</span>

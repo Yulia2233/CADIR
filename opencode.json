@@ -4,6 +4,11 @@
   "default_agent": "cadir-agent",
   "subagent_depth": 0,
   "share": "disabled",
+  "compaction": {
+    "auto": true,
+    "prune": true,
+    "reserved": 20000
+  },
   "provider": {
     "cadir": {
       "npm": "@ai-sdk/openai-compatible",
@@ -15,6 +20,11 @@
       "models": {
         "gpt-5.5": {
           "name": "GPT-5.5",
+          "limit": {
+            "context": 1050000,
+            "input": 620000,
+            "output": 128000
+          },
           "modalities": { "input": ["text", "image"], "output": ["text"] },
           "variants": {
             "low": { "reasoningEffort": "low" },

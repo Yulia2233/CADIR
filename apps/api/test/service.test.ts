@@ -7,7 +7,7 @@ import type { ModelOption } from "../../../packages/contracts/src/index.js";
 import type { AppConfig } from "../src/config.js";
 import type { OpenCodeAdapter, OpenCodeEvent, OpenCodeSession, PromptModel } from "../src/opencode.js";
 import type {
-  CaseIndexRequest, IndexTaskResponse, RetrievalAdapter, RetrievalQueryOptions, RetrievalResponse,
+  CaseIndexRequest, HybridRetrievalQueryOptions, IndexTaskResponse, RetrievalAdapter, RetrievalQueryOptions, RetrievalResponse,
 } from "../src/retrieval.js";
 import { CadirService } from "../src/service.js";
 import { JsonStore } from "../src/store.js";
@@ -57,6 +57,7 @@ class FakeAdapter implements OpenCodeAdapter {
 
 class FakeRetrievalAdapter implements RetrievalAdapter {
   textCalls: Array<{ query: string; options: RetrievalQueryOptions }> = [];
+  hybridCalls: Array<{ query: string; options: HybridRetrievalQueryOptions }> = [];
   imageCalls: Array<{ filename: string; options: RetrievalQueryOptions }> = [];
   indexCalls: CaseIndexRequest[] = [];
   failQueries = false;
@@ -68,6 +69,25 @@ class FakeRetrievalAdapter implements RetrievalAdapter {
       results: [
         { caseId: "case-a", rank: 1, matchKind: "full", summary: "Full plate" },
         { caseId: "case-b", rank: 2, matchKind: "subgraph", summary: "Bracket feature", subgraphMatches: [{ subgraphId: "sub-b", nodeCount: 12, score: 0.8 }] },
+      ],
+    };
+  }
+  async retrieveHybrid(query: string, options: HybridRetrievalQueryOptions): Promise<RetrievalResponse> {
+    this.hybridCalls.push({ query, options });
+    if (this.failQueries) throw new Error("hybrid retrieval offline");
+    return {
+      requestedTextTopK: options.textTopK,
+      requestedSubgraphTopK: options.subgraphTopK,
+      results: [
+        {
+          caseId: "case-hybrid-both", rank: 1, matchKind: "summary_text+subgraph",
+          provenance: ["summary_text", "subgraph"], textScore: 0.92, subgraphScore: 0.81,
+          summary: "A summary and subgraph match", subgraphMatches: [{ subgraphId: "sub-hybrid", score: 0.81 }],
+        },
+        {
+          caseId: "case-hybrid-text", rank: 2, matchKind: "summary_text",
+          provenance: ["summary_text"], textScore: 0.88, summary: "A summary-only match",
+        },
       ],
     };
   }
@@ -97,7 +117,7 @@ async function fixture(options: { retrievalUrl?: string } = {}) {
   await mkdir(jobsRoot);
   const config: AppConfig = {
     host: "127.0.0.1", port: 0, dataFile: join(root, "db.json"), jobsRoot, ragLibraryRoot: join(root, "rag-library"),
-    corsOrigin: "*", heartbeatMs: 50, watchdogMs: 1_000, openCodeUrl: "http://fake",
+    corsOrigin: "*", heartbeatMs: 50, watchdogMs: 1_000, failureGraceMs: 0, openCodeUrl: "http://fake",
     openCodeUsername: "opencode", openCodeAgent: "cadir-agent", modelProvider: "cadir", modelId: "gpt-5.6-sol",
     retrievalUrl: options.retrievalUrl,
   };
@@ -127,14 +147,58 @@ test("model settings use available image-capable models and snapshot onto new jo
   const available = await service.getModelSettings();
   assert.deepEqual(available.models.map((item) => item.id), ["gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"]);
   const updated = await service.updateModelSettings({ modelId: "gpt-5.5", effort: "high" });
-  assert.deepEqual(updated.settings, { modelId: "gpt-5.5", effort: "high", retrievalMode: "full_and_subgraph", retrievalPool: "both", subgraphMaxNodes: 16 });
+  assert.deepEqual(updated.settings, {
+    modelId: "gpt-5.5", effort: "high", selfEvolutionEnabled: true, retrievalMode: "full_and_subgraph", retrievalPool: "both",
+    subgraphMaxNodes: 16, retrievalTextTopK: 5, retrievalSubgraphTopK: 5,
+  });
   const conversation = await service.createConversation();
   const snapshot = await service.submitMessage(conversation.id, { content: "Use the selected model" });
   assert.deepEqual({ modelId: snapshot.job.modelId, modelProvider: snapshot.job.modelProvider, effort: snapshot.job.effort }, { modelId: "gpt-5.5", modelProvider: "cadir", effort: "high" });
-  assert.deepEqual({ retrievalMode: snapshot.job.retrievalMode, retrievalPool: snapshot.job.retrievalPool, subgraphMaxNodes: snapshot.job.subgraphMaxNodes }, { retrievalMode: "full_and_subgraph", retrievalPool: "both", subgraphMaxNodes: 16 });
+  assert.equal(snapshot.job.selfEvolutionEnabled, true);
+  assert.deepEqual({
+    retrievalMode: snapshot.job.retrievalMode, retrievalPool: snapshot.job.retrievalPool,
+    subgraphMaxNodes: snapshot.job.subgraphMaxNodes, retrievalTextTopK: snapshot.job.retrievalTextTopK,
+    retrievalSubgraphTopK: snapshot.job.retrievalSubgraphTopK,
+  }, {
+    retrievalMode: "full_and_subgraph", retrievalPool: "both", subgraphMaxNodes: 16,
+    retrievalTextTopK: 5, retrievalSubgraphTopK: 5,
+  });
   assert.deepEqual(adapter.prompts.at(-1)?.model, { modelId: "gpt-5.5", providerId: "cadir", effort: "high" });
   await assert.rejects(service.updateModelSettings({ modelId: "gpt-5.6", effort: "medium" }), (error: any) => error.code === "MODEL_NOT_ALLOWED");
   await assert.rejects(service.updateModelSettings({ modelId: "gpt-5.5", effort: "xhigh" as any }), (error: any) => error.code === "EFFORT_INVALID");
+  await assert.rejects(service.updateModelSettings({ retrievalTextTopK: 0 }), (error: any) => error.code === "RETRIEVAL_TEXT_TOP_K_INVALID");
+  await assert.rejects(service.updateModelSettings({ retrievalSubgraphTopK: 101 }), (error: any) => error.code === "RETRIEVAL_SUBGRAPH_TOP_K_INVALID");
+});
+
+test("hybrid retrieval uses configured summary-text and subgraph counts in one backend call", async () => {
+  const { service, retrieval, adapter } = await fixture();
+  await service.updateModelSettings({
+    retrievalMode: "hybrid", retrievalPool: "base", retrievalTextTopK: 2,
+    retrievalSubgraphTopK: 3, subgraphMaxNodes: 20,
+  });
+  const conversation = await service.createConversation();
+  const snapshot = await service.submitMessage(conversation.id, { content: "Create a reinforced flange" });
+  const response = await service.retrieveCases({
+    sessionID: snapshot.job.openCodeSessionId!, query: "reinforced flange", includeImages: true, topK: 9,
+  });
+
+  assert.equal(retrieval.hybridCalls.length, 1);
+  assert.equal(retrieval.textCalls.length, 0);
+  assert.equal(retrieval.imageCalls.length, 0);
+  assert.deepEqual(retrieval.hybridCalls[0].options.sources, ["base"]);
+  assert.equal(retrieval.hybridCalls[0].options.textTopK, 2);
+  assert.equal(retrieval.hybridCalls[0].options.subgraphTopK, 3);
+  assert.equal(retrieval.hybridCalls[0].options.subgraphMaxNodes, 20);
+  assert.equal(response.requestedTextTopK, 2);
+  assert.equal(response.requestedSubgraphTopK, 3);
+  assert.equal(response.requestedTopK, 5);
+  assert.equal(response.returnedCount, 2);
+  assert.equal(response.partial, true);
+  assert.match(adapter.prompts.at(-1)?.content ?? "", /hybrid retrieval: 2 summary-text Cases plus 3 3D-subgraph Cases/);
+  const completed = service.eventsAfter(snapshot.job.id, 0).find((event) => event.type === "retrieval.completed");
+  assert.equal(completed?.data.textTopK, 2);
+  assert.equal((completed?.data.cases as Array<Record<string, unknown>>)[0].matchKind, "summary_text+subgraph");
+  assert.match(service.getSnapshot(snapshot.job.id).stageRuns[0].toolActivities?.[0].summary ?? "", /summary_text\+subgraph/);
 });
 
 test("retrieval settings drive pool-scoped multimodal unique Case results and scoped Case reads", async () => {
@@ -340,6 +404,49 @@ test("OpenCode error events persist classified provider failures immediately", a
   assert.equal(snapshot.job.error?.detail, "Request timed out while contacting provider");
 });
 
+test("OpenCode failures drain in-flight retrieval callbacks before becoming terminal", async () => {
+  const { service, config, retrieval } = await fixture();
+  config.failureGraceMs = 40;
+  const conversation = await service.createConversation();
+  const initial = await service.submitMessage(conversation.id, { content: "Create a delayed retrieval test" });
+
+  await service.ingestOpenCodeEvent({
+    type: "session.error",
+    properties: { sessionID: "session-1", error: { data: { message: "Upstream HTTP/2 stream failed" } } },
+  });
+  await service.failJob(initial.job.id, "OPENCODE_ERROR", "duplicate watchdog failure", {
+    detail: "OpenCode reported a failed session state", source: "opencode", retryable: true,
+  });
+  assert.equal(service.getSnapshot(initial.job.id).job.status, "running");
+
+  const response = await service.retrieveCases({ sessionID: "session-1", query: "delayed retrieval" });
+  assert.equal(response.ok, true);
+  assert.equal(retrieval.textCalls.length, 1);
+
+  await new Promise((resolve) => setTimeout(resolve, 70));
+  const snapshot = service.getSnapshot(initial.job.id);
+  assert.equal(snapshot.job.status, "failed");
+  assert.equal(snapshot.job.error?.source, "opencode");
+  assert.equal(snapshot.job.error?.detail, "Upstream HTTP/2 stream failed");
+  assert.equal(service.eventsAfter(initial.job.id, 0).some((event) => event.type === "retrieval.completed"), true);
+});
+
+test("late tool errors do not replace the original OpenCode failure", async () => {
+  const { service } = await fixture();
+  const conversation = await service.createConversation();
+  const initial = await service.submitMessage(conversation.id, { content: "Preserve the provider error" });
+  await service.failJob(initial.job.id, "OPENCODE_ERROR", "OpenCode failed", {
+    detail: "Upstream HTTP/2 stream failed", source: "model_provider", retryable: true,
+  });
+  await service.failJobFromMessages(initial.job.id, [{
+    info: { role: "assistant" },
+    parts: [{ type: "tool", state: { status: "error", error: "ACTIVE_JOB_NOT_FOUND" } }],
+  }]);
+  const snapshot = service.getSnapshot(initial.job.id);
+  assert.equal(snapshot.job.error?.source, "model_provider");
+  assert.equal(snapshot.job.error?.detail, "Upstream HTTP/2 stream failed");
+});
+
 test("tool errors remain recoverable across a stage retry", async () => {
   const { service, adapter, config } = await fixture();
   const conversation = await service.createConversation();
@@ -431,6 +538,18 @@ test("cancel is committed before best-effort OpenCode abort", async () => {
   assert.equal(cancelled.stageRuns[0].status, "cancelled");
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(adapter.aborted, ["session-1"]);
+});
+
+test("cancelled jobs resume in the same OpenCode session", async () => {
+  const { service, adapter } = await fixture();
+  const conversation = await service.createConversation();
+  const initial = await service.submitMessage(conversation.id, { content: "Create a resumable bracket" });
+  await service.cancel(initial.job.id);
+  const resumed = await service.retryJob(initial.job.id);
+  assert.equal(resumed.job.status, "running");
+  assert.equal(resumed.job.openCodeSessionId, initial.job.openCodeSessionId);
+  assert.equal(adapter.prompts.at(-1)?.sessionId, initial.job.openCodeSessionId);
+  assert.equal(resumed.stageRuns.at(-1)?.attempt, 2);
 });
 
 test("snapshots survive a store restart", async () => {
@@ -590,6 +709,60 @@ test("final evolution transition is the authoritative completion boundary", asyn
   await assert.rejects(access(directory));
   await access(join(archive.path, "model.py"));
   assert.equal(store.read((state) => state.ragEntries.some((entry) => entry.sourceJobId === manifest.jobId)), true);
+});
+
+test("disabled self-evolution publishes from visual and completes without a dynamic Case", async () => {
+  const { service, jobsRoot, store, retrieval, adapter } = await fixture({ retrievalUrl: "http://retrieval" });
+  const settings = await service.updateModelSettings({ selfEvolutionEnabled: false });
+  assert.equal(settings.settings.selfEvolutionEnabled, false);
+  await assert.rejects(
+    service.updateModelSettings({ selfEvolutionEnabled: "no" as any }),
+    (error: any) => error.code === "SELF_EVOLUTION_INVALID",
+  );
+
+  const conversation = await service.createConversation();
+  const initial = await service.submitMessage(conversation.id, { content: "Create a plain spacer without archiving" });
+  assert.equal(initial.job.selfEvolutionEnabled, false);
+  assert.match(adapter.prompts.at(-1)?.content ?? "", /Self-evolution is disabled for this revision/);
+  const directory = join(jobsRoot, initial.job.id);
+  const add = async (name: string, kind: any, content = `test ${name}`) => {
+    const path = join(directory, name);
+    await writeFile(path, content);
+    return await service.registerArtifact({ sessionID: "session-1", path, kind, validated: true });
+  };
+
+  await add("requirements.md", "requirements", validRequirements);
+  await service.transition({ sessionID: "session-1", stage: "requirements", action: "complete" });
+  await add("model.py", "python");
+  await add("model.json", "other", "{}");
+  await service.transition({ sessionID: "session-1", stage: "codegen", action: "complete" });
+  for (const name of ["render-isometric.png", "render-front.png", "render-top.png", "render-right.png"]) await add(name, "image");
+
+  await assert.rejects(
+    service.transition({ sessionID: "session-1", stage: "evolution", action: "running" }),
+    (error: any) => error.code === "SELF_EVOLUTION_DISABLED",
+  );
+  await assert.rejects(
+    service.transition({ sessionID: "session-1", stage: "visual", action: "complete" }),
+    (error: any) => error.code === "FINAL_ARTIFACTS_MISSING",
+  );
+  assert.equal(service.getSnapshot(initial.job.id).job.currentStage, "visual");
+
+  await add("model.step", "step");
+  await add("model.stl", "stl");
+  await add("model.FCStd", "freecad");
+  await add("summary.md", "summary", "Final spacer summary");
+  await add("experience.md", "experience", "Reusable spacer experience");
+  await add("manifest.json", "other", "{}");
+  const complete = await service.transition({ sessionID: "session-1", stage: "visual", action: "complete", summary: "Published without self-evolution" });
+
+  assert.equal(complete.job.status, "completed");
+  assert.equal(complete.job.currentStage, undefined);
+  assert.equal(complete.stageRuns.some((run) => run.stage === "evolution"), false);
+  assert.equal(service.eventsAfter(initial.job.id, 0).at(-1)?.type, "job.completed");
+  assert.equal(store.read((state) => state.ragEntries.some((entry) => entry.sourceJobId === initial.job.id)), false);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(retrieval.indexCalls.length, 0);
 });
 
 test("deleting an active conversation aborts OpenCode and removes all session-owned files", async () => {

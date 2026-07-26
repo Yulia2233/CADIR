@@ -66,7 +66,10 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   app.get<{ Params: { jobId: string } }>("/api/jobs/:jobId/artifacts", async (request) => ({ artifacts: service.listArtifacts(request.params.jobId) }));
   app.get<{ Params: { jobId: string; artifactId: string } }>("/api/jobs/:jobId/artifacts/:artifactId/download", async (request, reply) => {
     const { artifact, stream } = service.artifactDownload(request.params.jobId, request.params.artifactId);
-    reply.header("content-type", artifact.mimeType).header("content-length", artifact.size).header("content-disposition", `attachment; filename="${artifact.name.replace(/["\r\n]/g, "_")}"`);
+    // Artifact metadata can describe a prior revision of a workspace file. Do
+    // not advertise a stale content length; the stream's actual EOF is the
+    // authoritative boundary for downloads.
+    reply.header("content-type", artifact.mimeType).header("content-disposition", `attachment; filename="${artifact.name.replace(/["\r\n]/g, "_")}"`);
     return reply.send(stream);
   });
 

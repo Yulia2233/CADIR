@@ -25,5 +25,8 @@ export interface DatabaseState {
 
 export const emptyDatabase = (): DatabaseState => ({
   conversations: [], jobs: [], stageRuns: [], messages: [], artifacts: [], uploads: [], events: [], ragEntries: [], retrievalGrants: [],
-  modelSettings: { modelId: "gpt-5.6-sol", effort: "medium", retrievalMode: "full_and_subgraph", retrievalPool: "both", subgraphMaxNodes: 16 },
+  modelSettings: {
+    modelId: "gpt-5.6-sol", effort: "medium", selfEvolutionEnabled: true, retrievalMode: "full_and_subgraph", retrievalPool: "both",
+    subgraphMaxNodes: 16, retrievalTextTopK: 5, retrievalSubgraphTopK: 5,
+  },
 });

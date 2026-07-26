@@ -8,7 +8,7 @@ export type JobStatus =
 
 export type StageKey = "requirements" | "codegen" | "visual" | "evolution";
 export type ModelEffort = "low" | "medium" | "high";
-export type RetrievalMode = "none" | "full" | "full_and_subgraph";
+export type RetrievalMode = "none" | "full" | "full_and_subgraph" | "hybrid";
 export type RetrievalPool = "base" | "dynamic" | "both";
 
 export type StageStatus =
@@ -48,8 +48,11 @@ export interface Job {
   modelId?: string;
   modelProvider?: string;
   effort?: ModelEffort;
+  selfEvolutionEnabled?: boolean;
   retrievalMode?: RetrievalMode;
   retrievalPool?: RetrievalPool;
+  retrievalTextTopK?: number;
+  retrievalSubgraphTopK?: number;
   subgraphMaxNodes?: number;
   revision?: number;
 }
@@ -65,8 +68,11 @@ export interface ModelOption {
 export interface ModelSettings {
   modelId: string;
   effort: ModelEffort;
+  selfEvolutionEnabled: boolean;
   retrievalMode: RetrievalMode;
   retrievalPool: RetrievalPool;
+  retrievalTextTopK: number;
+  retrievalSubgraphTopK: number;
   subgraphMaxNodes: number;
 }
 

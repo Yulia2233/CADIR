@@ -69,6 +69,8 @@ This index includes generated docs for the public SimpleCAD API surface, includi
 ## Tagging and Selection
 
 - [apply_tag](apply_tag.md) *(from operations.py)* `top-level`
+- [apply_tag_rselection](apply_tag_rselection.md) *(from operations.py)* `top-level`
+- [explain_tag](explain_tag.md) *(from operations.py)* `top-level`
 - [list_tags](list_tags.md) *(from operations.py)* `top-level`
 - [select_edges_by_tag](select_edges_by_tag.md) *(from operations.py)* `top-level`
 - [select_faces_by_tag](select_faces_by_tag.md) *(from operations.py)* `top-level`
@@ -111,11 +113,33 @@ This index includes generated docs for the public SimpleCAD API surface, includi
 ## Expressions and Parameters
 
 - [Const](Const.md) *(from expr.py)* `top-level`
+- [DimensionTolerance](DimensionTolerance.md) *(from expr.py)* `top-level`
 - [Expr](Expr.md) *(from expr.py)* `top-level`
 - [ExpressionGraph](ExpressionGraph.md) *(from expr.py)* `top-level`
+- [ToleranceAnalysis](ToleranceAnalysis.md) *(from tolerance.py)* `top-level`
+- [ToleranceAnalysisError](ToleranceAnalysisError.md) *(from tolerance.py)* `top-level`
+- [ToleranceCheck](ToleranceCheck.md) *(from tolerance.py)* `top-level`
+- [ToleranceContribution](ToleranceContribution.md) *(from tolerance.py)* `top-level`
+- [ToleranceGraph](ToleranceGraph.md) *(from tolerance.py)* `top-level`
+- [ToleranceReport](ToleranceReport.md) *(from tolerance.py)* `top-level`
+- [ToleranceRequirement](ToleranceRequirement.md) *(from tolerance.py)* `top-level`
+- [ToleranceValidationError](ToleranceValidationError.md) *(from tolerance.py)* `top-level`
 - [Var](Var.md) *(from expr.py)* `top-level`
+- [analyze_tolerance](analyze_tolerance.md) *(from tolerance.py)* `top-level`
+- [check_tolerance](check_tolerance.md) *(from tolerance.py)* `top-level`
 - [const](const_function.md) *(from expr.py)* `top-level`
 - [var](var_function.md) *(from expr.py)* `top-level`
+
+## Physical Units
+
+- [Dimension](Dimension.md) *(from units.py)* `top-level`
+- [Unit](Unit.md) *(from units.py)* `top-level`
+- [UnitValidationError](UnitValidationError.md) *(from units.py)* `top-level`
+- [canonical_unit_for_dimension](canonical_unit_for_dimension.md) *(from units.py)* `top-level`
+- [convert_value](convert_value.md) *(from units.py)* `top-level`
+- [expression_uses_units](expression_uses_units.md) *(from units.py)* `top-level`
+- [get_unit](get_unit.md) *(from units.py)* `top-level`
+- [infer_dimension](infer_dimension.md) *(from units.py)* `top-level`
 
 ## Types and Errors
 
@@ -207,11 +231,14 @@ This index includes generated docs for the public SimpleCAD API surface, includi
 - [meta](meta.md) *(from ql.py)* `submodule:ql`
 - [not_](not_.md) *(from ql.py)* `submodule:ql`
 - [or_](or_.md) *(from ql.py)* `submodule:ql`
+- [output_role](output_role.md) *(from ql.py)* `submodule:ql`
 - [place_component_rassembly](place_component_rassembly.md) *(from operations.py)* `top-level`
 - [radial_pattern_rsolidlist](radial_pattern_rsolidlist.md) *(from operations.py)* `top-level`
 - [render_screenshot_rpath](render_screenshot_rpath.md) *(from operations.py)* `top-level`
 - [select](select.md) *(from ql.py)* `submodule:ql`
 - [solve_assembly_constraints_rassembly](solve_assembly_constraints_rassembly.md) *(from operations.py)* `top-level`
+- [source_binding](source_binding.md) *(from ql.py)* `submodule:ql`
+- [source_topology](source_topology.md) *(from ql.py)* `submodule:ql`
 - [tag](tag.md) *(from ql.py)* `submodule:ql`
 - [unground_component_rassembly](unground_component_rassembly.md) *(from operations.py)* `top-level`
 - [value](value.md) *(from ql.py)* `submodule:ql`

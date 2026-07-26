@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import type { RetrievalMode, RetrievalSource } from "../../../packages/contracts/src/index.js";
 import type { AppConfig } from "./config.js";
 
-export type RetrievalScope = Exclude<RetrievalMode, "none"> | "subgraph";
+export type RetrievalScope = Exclude<RetrievalMode, "none" | "hybrid"> | "subgraph";
 
 export interface RetrievalQueryOptions {
   scope: RetrievalScope;
@@ -15,12 +15,27 @@ export interface RetrievalQueryOptions {
   revision?: number;
 }
 
+export interface HybridRetrievalQueryOptions {
+  sources: RetrievalSource[];
+  textTopK: number;
+  subgraphTopK: number;
+  subgraphMaxNodes: number;
+  excludeCaseIds?: string[];
+  requestId?: string;
+  jobId?: string;
+  revision?: number;
+}
+
 export interface RetrievalCaseResult {
   caseId: string;
   rank?: number;
   score?: number;
   fusedScore?: number;
-  matchKind?: "full" | "subgraph" | "both";
+  matchKind?: "full" | "subgraph" | "both" | "summary_text" | "summary_text+subgraph";
+  provenance?: Array<"summary_text" | "subgraph">;
+  textScore?: number;
+  subgraphScore?: number;
+  textMatch?: Record<string, unknown>;
   summary?: string;
   experiencePreview?: string;
   fullMatch?: Record<string, unknown>;
@@ -58,6 +73,7 @@ export interface IndexTaskResponse {
 export interface RetrievalAdapter {
   health(): Promise<boolean>;
   retrieveText(query: string, options: RetrievalQueryOptions): Promise<RetrievalResponse>;
+  retrieveHybrid(query: string, options: HybridRetrievalQueryOptions): Promise<RetrievalResponse>;
   retrieveImage(image: { bytes: Uint8Array; filename: string; mimeType: string }, options: RetrievalQueryOptions): Promise<RetrievalResponse>;
   indexCase(input: CaseIndexRequest): Promise<IndexTaskResponse>;
   indexTask(taskId: string): Promise<IndexTaskResponse>;
@@ -68,6 +84,7 @@ export class UnavailableRetrievalAdapter implements RetrievalAdapter {
   async health(): Promise<boolean> { return false; }
   private unavailable(): never { throw new Error("RETRIEVAL_URL is not configured"); }
   async retrieveText(): Promise<RetrievalResponse> { return this.unavailable(); }
+  async retrieveHybrid(): Promise<RetrievalResponse> { return this.unavailable(); }
   async retrieveImage(): Promise<RetrievalResponse> { return this.unavailable(); }
   async indexCase(): Promise<IndexTaskResponse> { return this.unavailable(); }
   async indexTask(): Promise<IndexTaskResponse> { return this.unavailable(); }
@@ -93,6 +110,13 @@ export class HttpRetrievalAdapter implements RetrievalAdapter {
 
   async retrieveText(query: string, options: RetrievalQueryOptions): Promise<RetrievalResponse> {
     return this.normalizeRetrieval(await this.request("/v1/retrieve/text", {
+      method: "POST",
+      body: JSON.stringify({ query, ...options }),
+    }));
+  }
+
+  async retrieveHybrid(query: string, options: HybridRetrievalQueryOptions): Promise<RetrievalResponse> {
+    return this.normalizeRetrieval(await this.request("/v1/retrieve/hybrid", {
       method: "POST",
       body: JSON.stringify({ query, ...options }),
     }));

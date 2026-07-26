@@ -360,11 +360,24 @@ a { color: inherit; }
 .retrieval-field { min-width: 0; padding: 0; border: 0; }
 .retrieval-field legend { padding: 0; }
 .retrieval-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.retrieval-mode-options { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .retrieval-option { min-height: 36px; padding: 4px 6px; color: #59645b; border: 1px solid #cbd1cb; border-radius: 5px; background: #fff; font-size: 11px; line-height: 1.25; }
 .retrieval-option:hover { background: #f0f3ef; }
 .retrieval-option.selected { color: #eef5ef; border-color: #3e5b46; background: #3e5b46; }
 .retrieval-option:disabled { cursor: default; opacity: 0.48; }
-.subgraph-limit-field { grid-template-columns: 1fr auto; align-items: center; }
+.retrieval-number-field { grid-template-columns: 1fr auto; align-items: center; }
+.hybrid-retrieval-settings { display: grid; gap: 0; padding: 10px 11px 0; margin-bottom: 15px; border-left: 2px solid #789680; background: #f5f8f5; }
+.hybrid-retrieval-settings .settings-field { margin-bottom: 10px; }
+.workflow-setting { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin: 0 0 13px; }
+.workflow-setting-copy { display: grid; gap: 3px; min-width: 0; }
+.workflow-setting-copy strong { color: #303a33; font-size: 12px; font-weight: 600; }
+.workflow-setting-copy span { color: #7a837c; font-size: 11px; line-height: 1.4; }
+.settings-switch { width: 38px; height: 22px; position: relative; flex: 0 0 auto; padding: 2px; border: 1px solid #bac3ba; border-radius: 12px; background: #e4e8e3; }
+.settings-switch span { display: block; width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(27, 36, 30, 0.22); transition: transform 140ms ease; }
+.settings-switch.on { border-color: #53735c; background: #53735c; }
+.settings-switch.on span { transform: translateX(16px); }
+.settings-switch:disabled { cursor: default; opacity: 0.55; }
+.settings-switch:focus-visible { outline: 2px solid rgba(102, 137, 111, 0.38); outline-offset: 2px; }
 .number-stepper { display: grid; grid-template-columns: 32px 52px 32px; height: 34px; border: 1px solid #c9cec9; border-radius: 5px; overflow: hidden; }
 .number-stepper button { display: grid; place-items: center; padding: 0; color: #536057; border: 0; background: #f5f7f4; }
 .number-stepper button:first-child { border-right: 1px solid #d5d9d5; }

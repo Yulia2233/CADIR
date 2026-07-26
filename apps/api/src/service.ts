@@ -3,7 +3,8 @@ import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/
 import { basename, extname, relative, resolve, sep } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import {
-  DEFAULT_SUBGRAPH_MAX_NODES, MAX_SUBGRAPH_MAX_NODES, MIN_SUBGRAPH_MAX_NODES, RETRIEVAL_MODES, RETRIEVAL_POOLS,
+  DEFAULT_RETRIEVAL_SUBGRAPH_TOP_K, DEFAULT_RETRIEVAL_TEXT_TOP_K, DEFAULT_SUBGRAPH_MAX_NODES,
+  MAX_RETRIEVAL_TOP_K, MAX_SUBGRAPH_MAX_NODES, MIN_RETRIEVAL_TOP_K, MIN_SUBGRAPH_MAX_NODES, RETRIEVAL_MODES, RETRIEVAL_POOLS,
   emptyUsage, isTerminalJob,
   type Artifact, type ArtifactKind, type Conversation, type CreateMessageRequest,
   type Job, type JobError, type JobEvent, type JobSnapshot, type RagArchiveEntry, type RagArchiveFile,
@@ -17,6 +18,7 @@ import {
   createRetrievalAdapter,
   type RetrievalAdapter,
   type RetrievalCaseResult,
+  type HybridRetrievalQueryOptions,
   type RetrievalQueryOptions,
   type RetrievalResponse,
 } from "./retrieval.js";
@@ -93,6 +95,8 @@ function withoutCacheTotal(usage: TokenUsage): TokenUsage {
 }
 
 export class CadirService {
+  private readonly pendingFailures = new Map<string, { error: JobError; timer: NodeJS.Timeout }>();
+
   private readonly deletionTasks = new Map<string, Promise<DeleteConversationResult>>();
   private readonly indexingTasks = new Map<string, Promise<void>>();
 
@@ -300,10 +304,25 @@ export class CadirService {
       "Do not restart the requirements stage or create a new model from scratch.",
       `Read the existing requirements.md, model.py, model.json, and the current artifacts in ${workspacePath}.`,
       "Preserve the existing model and requirements unless the user's change requires a direct update.",
-      "Apply the requested change directly to model.py and model.json, run cadir_run, then continue through visual feedback and self-evolution.",
+      "Apply the requested change directly to model.py and model.json, run cadir_run, then continue through visual feedback and the workflow policy specified above.",
       "Before publishing, update summary.md and experience.md so they include the original requirement and all completed modifications in this CAD session.",
       `User modification request:\n${content.trim()}`,
     ].join("\n\n") + images;
+  }
+
+  private workflowInstruction(selfEvolutionEnabled: boolean): string {
+    if (selfEvolutionEnabled) {
+      return [
+        "Self-evolution is enabled for this revision.",
+        "After all four visual views pass, call cadir_stage(visual, complete), then update summary.md and experience.md as cumulative documents, call cadir_publish exactly once, and call cadir_stage(evolution, complete).",
+      ].join(" ");
+    }
+    return [
+      "Self-evolution is disabled for this revision.",
+      "Do not start or complete an evolution stage and do not call cadir_stage(evolution, ...).",
+      "After all four visual views pass, update summary.md and experience.md as cumulative documents, call cadir_publish exactly once while visual is still the active stage, and then call cadir_stage(visual, complete).",
+      "The backend will validate the final artifacts and complete the Job directly; this revision must not be archived or embedded into the dynamic Case library.",
+    ].join(" ");
   }
 
   private normalizeSettings(value?: Partial<ModelSettings>): ModelSettings {
@@ -313,12 +332,21 @@ export class CadirService {
     const subgraphMaxNodes = Number.isSafeInteger(requestedNodes)
       ? Math.min(MAX_SUBGRAPH_MAX_NODES, Math.max(MIN_SUBGRAPH_MAX_NODES, requestedNodes))
       : DEFAULT_SUBGRAPH_MAX_NODES;
+    const normalizeTopK = (candidate: unknown, fallback: number): number => {
+      const requested = Number(candidate ?? fallback);
+      return Number.isSafeInteger(requested)
+        ? Math.min(MAX_RETRIEVAL_TOP_K, Math.max(MIN_RETRIEVAL_TOP_K, requested))
+        : fallback;
+    };
     return {
       modelId: value?.modelId ?? this.config.modelId,
       effort: value?.effort && effortIds.includes(value.effort) ? value.effort : "medium",
+      selfEvolutionEnabled: value?.selfEvolutionEnabled !== false,
       retrievalMode: mode,
       retrievalPool: pool,
       subgraphMaxNodes,
+      retrievalTextTopK: normalizeTopK(value?.retrievalTextTopK, DEFAULT_RETRIEVAL_TEXT_TOP_K),
+      retrievalSubgraphTopK: normalizeTopK(value?.retrievalSubgraphTopK, DEFAULT_RETRIEVAL_SUBGRAPH_TOP_K),
     };
   }
 
@@ -326,7 +354,11 @@ export class CadirService {
     if (settings.retrievalMode === "none") {
       return "CADIR retrieval is disabled for this revision. Do not call cadir_retrieve or cadir_case_read.";
     }
-    const scope = settings.retrievalMode === "full" ? "complete CAD cases only" : `complete CAD cases plus 3D subgraphs with at most ${settings.subgraphMaxNodes} nodes`;
+    const scope = settings.retrievalMode === "full"
+      ? "complete CAD cases only"
+      : settings.retrievalMode === "hybrid"
+        ? `hybrid retrieval: ${settings.retrievalTextTopK} summary-text Cases plus ${settings.retrievalSubgraphTopK} 3D-subgraph Cases, with subgraphs limited to ${settings.subgraphMaxNodes} nodes`
+        : `complete CAD cases plus 3D subgraphs with at most ${settings.subgraphMaxNodes} nodes`;
     const pool = settings.retrievalPool === "base" ? "the base Case library only" : settings.retrievalPool === "dynamic" ? "the dynamic Case library only" : "both the base and dynamic Case libraries";
     return `CADIR retrieval is enabled for ${scope}, using ${pool}. Before writing or repairing model.py, call cadir_retrieve with the current user request, inspect the unique Case summaries, and call cadir_case_read only for the most relevant one or two Cases.`;
   }
@@ -342,11 +374,20 @@ export class CadirService {
     const requested = { ...current, ...input };
     if (!modelIds.has(requested.modelId)) throw new AppError(400, "MODEL_NOT_ALLOWED", "model is not an allowed CADIR model");
     if (!effortIds.includes(requested.effort)) throw new AppError(400, "EFFORT_INVALID", "effort must be low, medium, or high");
-    if (!retrievalModeIds.has(requested.retrievalMode)) throw new AppError(400, "RETRIEVAL_MODE_INVALID", "retrieval mode must be none, full, or full_and_subgraph");
+    if (typeof requested.selfEvolutionEnabled !== "boolean") throw new AppError(400, "SELF_EVOLUTION_INVALID", "selfEvolutionEnabled must be a boolean");
+    if (!retrievalModeIds.has(requested.retrievalMode)) throw new AppError(400, "RETRIEVAL_MODE_INVALID", "retrieval mode must be none, full, full_and_subgraph, or hybrid");
     if (!retrievalPoolIds.has(requested.retrievalPool)) throw new AppError(400, "RETRIEVAL_POOL_INVALID", "retrieval pool must be base, dynamic, or both");
     const nodeLimit = Number(requested.subgraphMaxNodes);
     if (!Number.isSafeInteger(nodeLimit) || nodeLimit < MIN_SUBGRAPH_MAX_NODES || nodeLimit > MAX_SUBGRAPH_MAX_NODES) {
       throw new AppError(400, "SUBGRAPH_NODE_LIMIT_INVALID", `subgraphMaxNodes must be an integer from ${MIN_SUBGRAPH_MAX_NODES} to ${MAX_SUBGRAPH_MAX_NODES}`);
+    }
+    const textTopK = Number(requested.retrievalTextTopK);
+    if (!Number.isSafeInteger(textTopK) || textTopK < MIN_RETRIEVAL_TOP_K || textTopK > MAX_RETRIEVAL_TOP_K) {
+      throw new AppError(400, "RETRIEVAL_TEXT_TOP_K_INVALID", `retrievalTextTopK must be an integer from ${MIN_RETRIEVAL_TOP_K} to ${MAX_RETRIEVAL_TOP_K}`);
+    }
+    const subgraphTopK = Number(requested.retrievalSubgraphTopK);
+    if (!Number.isSafeInteger(subgraphTopK) || subgraphTopK < MIN_RETRIEVAL_TOP_K || subgraphTopK > MAX_RETRIEVAL_TOP_K) {
+      throw new AppError(400, "RETRIEVAL_SUBGRAPH_TOP_K_INVALID", `retrievalSubgraphTopK must be an integer from ${MIN_RETRIEVAL_TOP_K} to ${MAX_RETRIEVAL_TOP_K}`);
     }
     const models = (await this.adapter.availableModels()).filter((item) => modelIds.has(item.id) && item.imageInput);
     const selected = models.find((item) => item.id === requested.modelId);
@@ -355,7 +396,8 @@ export class CadirService {
     if (selected && !selected.efforts.includes(requested.effort)) throw new AppError(409, "EFFORT_UNAVAILABLE", "selected effort is not supported by this model");
     await this.store.transaction((state) => {
       state.modelSettings = {
-        modelId: requested.modelId, effort: requested.effort, retrievalMode: requested.retrievalMode, retrievalPool: requested.retrievalPool, subgraphMaxNodes: nodeLimit,
+        modelId: requested.modelId, effort: requested.effort, selfEvolutionEnabled: requested.selfEvolutionEnabled, retrievalMode: requested.retrievalMode, retrievalPool: requested.retrievalPool,
+        subgraphMaxNodes: nodeLimit, retrievalTextTopK: textTopK, retrievalSubgraphTopK: subgraphTopK,
       };
     });
     return await this.getModelSettings();
@@ -390,18 +432,26 @@ export class CadirService {
     if (retrievalMode === "none") return { ok: true, enabled: false, mode: "none", results: [] };
     const requestedTopK = Number(input.topK ?? this.config.retrievalTopK ?? 5);
     const topK = Number.isFinite(requestedTopK) ? Math.min(10, Math.max(1, Math.trunc(requestedTopK))) : 5;
+    const textTopK = job.retrievalTextTopK ?? DEFAULT_RETRIEVAL_TEXT_TOP_K;
+    const subgraphTopK = job.retrievalSubgraphTopK ?? DEFAULT_RETRIEVAL_SUBGRAPH_TOP_K;
+    const targetCount = retrievalMode === "hybrid" ? textTopK + subgraphTopK : topK;
+    const requestId = randomUUID();
     const options: RetrievalQueryOptions = {
-      scope: retrievalMode,
+      scope: retrievalMode === "hybrid" ? "full_and_subgraph" : retrievalMode,
       sources: retrievalSources(job.retrievalPool ?? "both"),
       topK,
       subgraphMaxNodes: job.subgraphMaxNodes ?? DEFAULT_SUBGRAPH_MAX_NODES,
       excludeCaseIds: [job.id],
-      requestId: randomUUID(),
+      requestId,
       jobId: job.id,
       revision: this.jobRevision(job),
     };
+    const hybridOptions: HybridRetrievalQueryOptions = {
+      sources: options.sources, textTopK, subgraphTopK, subgraphMaxNodes: options.subgraphMaxNodes,
+      excludeCaseIds: options.excludeCaseIds, requestId, jobId: options.jobId, revision: options.revision,
+    };
     const activity: ToolActivity = {
-      id: options.requestId!, tool: "cadir_retrieve", status: "running",
+      id: requestId, tool: "cadir_retrieve", status: "running",
       query: this.compactText(query, 240), startedAt: now(),
     };
     const started = await this.store.transaction((state) => {
@@ -409,7 +459,8 @@ export class CadirService {
       if (!current || isTerminalJob(current.status)) return [];
       const run = this.upsertToolActivity(state, current, activity);
       const event = this.appendEvent(state, current, "retrieval.started", {
-        query, scope: options.scope, sources: options.sources, topK, subgraphMaxNodes: options.subgraphMaxNodes,
+        query, scope: retrievalMode, sources: options.sources, topK: targetCount, textTopK, subgraphTopK,
+        subgraphMaxNodes: options.subgraphMaxNodes,
         ...this.toolEventData(run, activity),
       });
       activity.orderSeq = event.seq;
@@ -418,14 +469,16 @@ export class CadirService {
     });
     this.store.publish(started);
 
-    const imageArtifacts = input.includeImages === false ? [] : this.store.read((state) => state.artifacts.filter((artifact) =>
+    const imageArtifacts = input.includeImages === false || retrievalMode === "hybrid" ? [] : this.store.read((state) => state.artifacts.filter((artifact) =>
       artifact.jobId === job.id
       && this.isCurrentRevision(job, artifact.revision)
       && artifact.kind === "image"
       && artifact.validated
       && artifact.downloadUrl.startsWith("/api/uploads/"),
     ));
-    const calls: Array<Promise<RetrievalResponse>> = [this.retrieval.retrieveText(query, options)];
+    const calls: Array<Promise<RetrievalResponse>> = [retrievalMode === "hybrid"
+      ? this.retrieval.retrieveHybrid(query, hybridOptions)
+      : this.retrieval.retrieveText(query, options)];
     for (const artifact of imageArtifacts) {
       calls.push(readFile(artifact.path).then((bytes) => this.retrieval.retrieveImage({
         bytes, filename: artifact.name, mimeType: artifact.mimeType,
@@ -451,7 +504,9 @@ export class CadirService {
       return { ok: false, enabled: true, mode: retrievalMode, error: { code: "RETRIEVAL_UNAVAILABLE", message: "Case retrieval is unavailable; continue without retrieved Cases", detail }, results: [] };
     }
 
-    const results = this.mergeRetrievalResults(responses, topK);
+    const results = retrievalMode === "hybrid"
+      ? responses[0].results.slice(0, targetCount).map((item, index) => ({ ...item, rank: index + 1 }))
+      : this.mergeRetrievalResults(responses, topK);
     const grantId = randomUUID();
     const completed = await this.store.transaction((state) => {
       const current = state.jobs.find((item) => item.id === job.id);
@@ -460,24 +515,33 @@ export class CadirService {
         id: grantId, jobId: job.id, revision: this.jobRevision(job), query,
         caseIds: results.map((item) => item.caseId), results: results.map((item) => ({ ...item })), createdAt: now(),
       });
-      const summaries = results.map((item) => this.compactText(item.summary, 120)).filter((item): item is string => Boolean(item));
+      const summaries = results.map((item) => {
+        const source = item.provenance?.join("+") ?? item.matchKind ?? "case";
+        const summary = this.compactText(item.summary, 100) ?? "No summary";
+        return `[${source}] ${item.caseId}: ${summary}`;
+      });
       const completedActivity: ToolActivity = {
         ...activity, status: "completed", resultCount: results.length,
         summary: this.compactText(summaries.slice(0, 3).join("；")), completedAt: now(),
       };
       const run = this.upsertToolActivity(state, current, completedActivity);
       return [this.appendEvent(state, current, "retrieval.completed", {
-        grantId, scope: options.scope, sources: options.sources, subgraphMaxNodes: options.subgraphMaxNodes,
+        grantId, scope: retrievalMode, sources: options.sources, textTopK, subgraphTopK, subgraphMaxNodes: options.subgraphMaxNodes,
         returnedCount: results.length,
-        cases: results.map((item) => ({ caseId: item.caseId, rank: item.rank, matchKind: item.matchKind, summary: item.summary })),
+        cases: results.map((item) => ({
+          caseId: item.caseId, rank: item.rank, matchKind: item.matchKind, provenance: item.provenance,
+          textScore: item.textScore, subgraphScore: item.subgraphScore, summary: item.summary,
+        })),
         partialFailures: settled.length - responses.length,
         ...this.toolEventData(run, completedActivity),
       })];
     });
     this.store.publish(completed);
     return {
-      ok: true, enabled: true, mode: retrievalMode, pool: job.retrievalPool ?? "both", grantId, requestedTopK: topK,
-      returnedCount: results.length, partial: results.length < topK, results,
+      ok: true, enabled: true, mode: retrievalMode, pool: job.retrievalPool ?? "both", grantId,
+      requestedTopK: targetCount, requestedTextTopK: retrievalMode === "hybrid" ? textTopK : undefined,
+      requestedSubgraphTopK: retrievalMode === "hybrid" ? subgraphTopK : undefined,
+      returnedCount: results.length, partial: results.length < targetCount, results,
     };
   }
 
@@ -593,15 +657,17 @@ export class CadirService {
     const userPrompt = uploads.length
       ? `${request.content.trim()}\n\nInput reference images (read these exact paths before modeling):\n${uploads.map((item) => `- ${item.localPath}`).join("\n")}`
       : request.content.trim();
-    const prompt = `${this.retrievalInstruction(selectedSettings)}\n\n${userPrompt}`;
+    const prompt = `${this.retrievalInstruction(selectedSettings)}\n${this.workflowInstruction(selectedSettings.selfEvolutionEnabled)}\n\n${userPrompt}`;
     const timestamp = now();
     const initialEvents = await this.store.transaction((state) => {
       const liveConversation = state.conversations.find((item) => item.id === conversationId)!;
       const job: Job = {
         id: jobId, conversationId, status: "running", currentStage: "requirements", workspacePath,
         createdAt: timestamp, startedAt: timestamp, updatedAt: timestamp, backendHeartbeatAt: timestamp,
-        modelId: selectedSettings.modelId, modelProvider: this.config.modelProvider, effort: selectedSettings.effort,
+         modelId: selectedSettings.modelId, modelProvider: this.config.modelProvider, effort: selectedSettings.effort,
+         selfEvolutionEnabled: selectedSettings.selfEvolutionEnabled,
         retrievalMode: selectedSettings.retrievalMode, retrievalPool: selectedSettings.retrievalPool, subgraphMaxNodes: selectedSettings.subgraphMaxNodes, revision: 1,
+        retrievalTextTopK: selectedSettings.retrievalTextTopK, retrievalSubgraphTopK: selectedSettings.retrievalSubgraphTopK,
       };
       state.jobs.push(job);
       const stageRunId = randomUUID();
@@ -644,7 +710,7 @@ export class CadirService {
     const selectedSettings = this.normalizeSettings(this.store.read((state) => state.modelSettings));
     const usageBaseline = await this.readUsageBaseline(existingJob);
     const uploads = await this.localizeUploads(existingJob.workspacePath, this.resolveUploads(conversation.id, request.imageArtifactIds ?? []));
-    const prompt = `${this.retrievalInstruction(selectedSettings)}\n\n${this.modificationPrompt(request.content, existingJob.workspacePath, uploads)}`;
+    const prompt = `${this.retrievalInstruction(selectedSettings)}\n${this.workflowInstruction(selectedSettings.selfEvolutionEnabled)}\n\n${this.modificationPrompt(request.content, existingJob.workspacePath, uploads)}`;
     const timestamp = now();
     const events = await this.store.transaction((state) => {
       const job = state.jobs.find((item) => item.id === jobId && item.conversationId === conversation.id);
@@ -664,9 +730,12 @@ export class CadirService {
       job.modelId = selectedSettings.modelId;
       job.modelProvider = this.config.modelProvider;
       job.effort = selectedSettings.effort;
+      job.selfEvolutionEnabled = selectedSettings.selfEvolutionEnabled;
       job.retrievalMode = selectedSettings.retrievalMode;
       job.retrievalPool = selectedSettings.retrievalPool;
       job.subgraphMaxNodes = selectedSettings.subgraphMaxNodes;
+      job.retrievalTextTopK = selectedSettings.retrievalTextTopK;
+      job.retrievalSubgraphTopK = selectedSettings.retrievalSubgraphTopK;
       state.stageRuns.push({ id: stageRunId, jobId, stage: "codegen", revision: nextRevision, attempt: 1, status: "running", usage: emptyUsage(), usageBaseline, startedAt: timestamp });
       const previousRequirements = [...state.artifacts].reverse().find((item) =>
         item.jobId === job.id && item.name.toLowerCase() === "requirements.md" && item.validated && !item.partial);
@@ -793,6 +862,9 @@ export class CadirService {
       const job = [...state.jobs].reverse().find((item) => item.openCodeSessionId === request.sessionID);
       if (!job) throw new AppError(404, "ACTIVE_JOB_NOT_FOUND", "no active job for this OpenCode session");
       if (isTerminalJob(job.status)) return [];
+      if (request.stage === "evolution" && job.selfEvolutionEnabled === false) {
+        throw new AppError(409, "SELF_EVOLUTION_DISABLED", "self-evolution is disabled for this revision");
+      }
       if (request.action === "running") {
         const existing = [...this.currentStageRuns(state, job)].reverse().find((item) => item.stage === request.stage && item.status === "running");
         if (existing) return [];
@@ -841,13 +913,21 @@ export class CadirService {
         await this.assertStageArtifacts(state, job.id, request.stage, run.id);
         run.status = "completed"; run.completedAt = timestamp; run.summary = request.summary; run.toolError = undefined;
         emitted.push(this.appendEvent(state, job, "stage.updated", this.stageEventData(run, { summary: request.summary })));
-        const next = request.stage === "requirements" ? "codegen" : request.stage === "codegen" ? "visual" : request.stage === "visual" ? "evolution" : undefined;
+        const next = request.stage === "requirements" ? "codegen" : request.stage === "codegen" ? "visual" : request.stage === "visual" && job.selfEvolutionEnabled !== false ? "evolution" : undefined;
         if (next) {
           job.currentStage = next;
           const attempt = Math.max(0, ...this.currentStageRuns(state, job).filter((item) => item.stage === next).map((item) => item.attempt)) + 1;
           const nextRun: StageRun = { id: randomUUID(), jobId: job.id, stage: next, revision: this.jobRevision(job), attempt, status: "running", usage: emptyUsage(), usageBaseline, startedAt: timestamp };
           state.stageRuns.push(nextRun);
           emitted.push(this.appendEvent(state, job, "stage.updated", this.stageEventData(nextRun, { label: eventName(next) })));
+        } else if (request.stage === "visual" && job.selfEvolutionEnabled === false) {
+          this.assertPublishArtifacts(state, job.id);
+          job.status = "completed"; job.summary = request.summary ?? job.summary; job.completedAt = timestamp; job.currentStage = undefined;
+          emitted.push(this.appendEvent(state, job, "job.completed", {
+            summary: job.summary,
+            revision: this.jobRevision(job),
+            artifacts: state.artifacts.filter((item) => item.jobId === job.id && this.isCurrentRevision(job, item.revision) && item.validated).map((item) => ({ name: item.name, path: item.path, downloadUrl: item.downloadUrl })),
+          }));
         } else if (request.stage === "evolution") {
           const latestVisual = [...this.currentStageRuns(state, job)].reverse().find((item) => item.stage === "visual");
           if (latestVisual?.status !== "completed") throw new AppError(409, "EVOLUTION_REQUIRES_VISUAL_PASS", "evolution starts only after visual feedback passes");
@@ -886,7 +966,9 @@ export class CadirService {
     this.store.publish(events);
     const jobId = events[0]?.jobId ?? this.store.read((state) => [...state.jobs].reverse().find((item) => item.openCodeSessionId === request.sessionID)?.id);
     if (!jobId) throw new AppError(404, "ACTIVE_JOB_NOT_FOUND", "job not found");
-    if (events.some((event) => event.type === "job.completed")) this.queueCaseIndex(jobId);
+    if (events.some((event) => event.type === "job.completed") && this.store.read((state) => state.jobs.find((item) => item.id === jobId)?.selfEvolutionEnabled !== false)) {
+      this.queueCaseIndex(jobId);
+    }
     return this.getSnapshot(jobId);
   }
 
@@ -914,7 +996,9 @@ export class CadirService {
     const events = await this.store.transaction((state) => {
       const job = state.jobs.find((item) => item.id === jobId);
       if (!job) throw notFound("job");
-      if (job.status !== "failed") throw new AppError(409, "JOB_NOT_FAILED", "only a failed job can be retried");
+      if (job.status !== "failed" && job.status !== "cancelled") {
+        throw new AppError(409, "JOB_NOT_RETRYABLE", "only a failed or cancelled job can be retried");
+      }
       sessionId = job.openCodeSessionId;
       if (!sessionId) throw new AppError(409, "OPENCODE_SESSION_MISSING", "job has no OpenCode session");
       const stage = job.currentStage ?? "requirements";
@@ -929,7 +1013,7 @@ export class CadirService {
     this.store.publish(events);
     try {
       const job = this.getSnapshot(jobId).job;
-      await this.adapter.prompt(sessionId!, "Continue the current CAD task from the failed stage. Inspect the previous error, repair it, and proceed.", job.workspacePath, this.promptModel(job));
+      await this.adapter.prompt(sessionId!, `${this.workflowInstruction(job.selfEvolutionEnabled !== false)}\nContinue the current CAD task from the failed stage. Inspect the previous error, repair it, and proceed.`, job.workspacePath, this.promptModel(job));
     }
     catch (error) { await this.failJob(jobId, "OPENCODE_UNAVAILABLE", this.safeError(error)); }
     return this.getSnapshot(jobId);
@@ -1143,7 +1227,7 @@ export class CadirService {
 
   async failJob(jobId: string, code: string, message: string, errorDetails: Partial<JobError> = {}): Promise<void> {
     const error: JobError = { code, message, ...errorDetails };
-    await this.persistJobFailure(jobId, error, false);
+    await this.failOrDefer(jobId, error, false);
   }
 
   async failJobFromMessages(jobId: string, messages: unknown[]): Promise<boolean> {
@@ -1153,8 +1237,51 @@ export class CadirService {
     });
     const raw = this.findMessageError(messages, includeToolErrors);
     if (!raw) return false;
-    await this.persistJobFailure(jobId, this.classifyOpenCodeError(raw.detail, raw.source), true);
+    const error = this.classifyOpenCodeError(raw.detail, raw.source);
+    if (includeToolErrors) await this.persistJobFailure(jobId, error, true);
+    else await this.failOrDefer(jobId, error, false);
     return true;
+  }
+
+  private async failOrDefer(jobId: string, error: JobError, refineTerminal: boolean): Promise<void> {
+    const terminal = this.store.read((state) => {
+      const job = state.jobs.find((item) => item.id === jobId);
+      return !job || isTerminalJob(job.status);
+    });
+    if (terminal || !this.shouldDrainToolCallbacks(error)) {
+      await this.persistJobFailure(jobId, error, refineTerminal);
+      return;
+    }
+
+    const graceMs = Math.max(0, Math.trunc(this.config.failureGraceMs ?? 15_000));
+    if (graceMs === 0) {
+      await this.persistJobFailure(jobId, error, refineTerminal);
+      return;
+    }
+    // The event stream and watchdog can report the same provider failure more
+    // than once. Keep the first root cause and let its full drain window elapse.
+    if (this.pendingFailures.has(jobId)) return;
+
+    const timer = setTimeout(() => {
+      void this.flushPendingFailure(jobId);
+    }, graceMs);
+    timer.unref();
+    this.pendingFailures.set(jobId, { error, timer });
+  }
+
+  private shouldDrainToolCallbacks(error: JobError): boolean {
+    if (error.source === "tool") return false;
+    return error.code === "OPENCODE_ERROR"
+      || error.code === "OPENCODE_SESSION_LOST"
+      || error.source === "model_provider"
+      || error.source === "opencode";
+  }
+
+  private async flushPendingFailure(jobId: string): Promise<void> {
+    const pending = this.pendingFailures.get(jobId);
+    if (!pending) return;
+    this.pendingFailures.delete(jobId);
+    await this.persistJobFailure(jobId, pending.error, false);
   }
 
   private async persistJobFailure(jobId: string, error: JobError, refineTerminal: boolean): Promise<void> {
@@ -1163,6 +1290,10 @@ export class CadirService {
       if (!job) return [];
       if (isTerminalJob(job.status)) {
         if (!refineTerminal || job.status !== "failed" || job.error?.detail === error.detail) return [];
+        // A late tool callback must never replace the provider/session error that
+        // caused the Job to terminate. It is only a secondary symptom.
+        if (job.error?.source && job.error.source !== "tool" && error.source === "tool") return [];
+        if (error.detail?.includes("ACTIVE_JOB_NOT_FOUND")) return [];
         job.error = error;
         const failedRun = [...state.stageRuns].reverse().find((item) => item.jobId === job.id && this.isCurrentRevision(job, item.revision) && item.status === "failed");
         if (failedRun) failedRun.error = error;
